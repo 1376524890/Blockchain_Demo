@@ -2,6 +2,7 @@
 
 #include "common/types.h"
 
+#include <algorithm>
 #include <sstream>
 
 namespace rbft {
@@ -78,6 +79,24 @@ ConsensusMessage ConsensusMessageFromJson(const nlohmann::json& j) {
     return msg;
 }
 
+nlohmann::json ConsensusEventToJson(const ConsensusEvent& event) {
+    return {
+        {"id", event.id},
+        {"timestamp", event.timestamp},
+        {"node_id", event.node_id},
+        {"height", event.height},
+        {"view", event.view},
+        {"instance_id", event.instance_id},
+        {"event_type", event.event_type},
+        {"from", event.from},
+        {"to", event.to},
+        {"block_hash", event.block_hash},
+        {"accepted", event.accepted},
+        {"reason", event.reason},
+        {"attack_mode", event.attack_mode}
+    };
+}
+
 ConsensusEngine::ConsensusEngine(NodeConfig config) : config_(std::move(config)) {}
 
 std::string ConsensusEngine::Primary(uint64_t view, uint32_t instance_id) const {
@@ -92,11 +111,20 @@ int ConsensusEngine::Quorum() const {
     return 2 * config_.f + 1;
 }
 
-void ConsensusEngine::SetAttackMode(AttackMode mode) { attack_mode_ = mode; }
+void ConsensusEngine::SetAttackMode(AttackMode mode) {
+    attack_mode_ = mode;
+    AddEvent({0, 0, "", 0, 0, 0, "ATTACK_MODE_SET", config_.node_id, config_.node_id, "", true, "", ""});
+}
 AttackMode ConsensusEngine::GetAttackMode() const { return attack_mode_; }
 bool ConsensusEngine::IsRunning() const { return running_ && attack_mode_ != AttackMode::NODE_CRASH_SIMULATED; }
-void ConsensusEngine::Stop() { running_ = false; }
-void ConsensusEngine::Start() { running_ = true; }
+void ConsensusEngine::Stop() {
+    running_ = false;
+    AddEvent({0, 0, "", 0, 0, 0, "CONSENSUS_STOP", config_.node_id, config_.node_id, "", true, "", ""});
+}
+void ConsensusEngine::Start() {
+    running_ = true;
+    AddEvent({0, 0, "", 0, 0, 0, "CONSENSUS_START", config_.node_id, config_.node_id, "", true, "", ""});
+}
 
 bool ConsensusEngine::RecordVote(const ConsensusMessage& msg, std::string& evidence) {
     // 投票安全规则：同一 sender 在同一 height/view/instance/type 只能绑定一个 block_hash。
@@ -115,10 +143,30 @@ bool ConsensusEngine::RecordVote(const ConsensusMessage& msg, std::string& evide
         };
         evidence_.push_back(ev);
         evidence = ev.dump();
+        AddEvent({0, 0, "", msg.height, msg.view, msg.instance_id, "CONFLICTING_VOTE",
+                  msg.sender_id, config_.node_id, msg.block_hash, false, evidence, ""});
         return false;
     }
     table.Put(key, msg.block_hash);
+    AddEvent({0, 0, "", msg.height, msg.view, msg.instance_id, msg.type,
+              msg.sender_id, config_.node_id, msg.block_hash, true, "", ""});
     return true;
+}
+
+void ConsensusEngine::AddEvent(ConsensusEvent event) {
+    event.id = next_event_id_++;
+    event.timestamp = event.timestamp == 0 ? NowMillis() : event.timestamp;
+    event.node_id = event.node_id.empty() ? config_.node_id : event.node_id;
+    event.attack_mode = event.attack_mode.empty() ? AttackModeToString(attack_mode_) : event.attack_mode;
+    events_.push_back(std::move(event));
+    if (events_.size() > 1000) {
+        events_.erase(events_.begin(), events_.begin() + static_cast<std::ptrdiff_t>(events_.size() - 1000));
+    }
+}
+
+std::vector<ConsensusEvent> ConsensusEngine::RecentEvents(size_t limit) const {
+    const size_t count = std::min(limit, events_.size());
+    return std::vector<ConsensusEvent>(events_.end() - static_cast<std::ptrdiff_t>(count), events_.end());
 }
 
 nlohmann::json ConsensusEngine::Status() const {

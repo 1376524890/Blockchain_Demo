@@ -19,7 +19,7 @@ static const char* LevelName(LogLevel level) {
     switch (level) {
         case LogLevel::INFO: return "INFO";
         case LogLevel::WARN: return "WARN";
-        case LogLevel::ERROR: return "ERROR";
+        case LogLevel::ERROR_LEVEL: return "ERROR";
         case LogLevel::DEBUG: return "DEBUG";
     }
     return "INFO";
@@ -40,7 +40,7 @@ void Logger::Log(LogLevel level, const std::string& message) {
 
 void Logger::Info(const std::string& message) { Log(LogLevel::INFO, message); }
 void Logger::Warn(const std::string& message) { Log(LogLevel::WARN, message); }
-void Logger::Error(const std::string& message) { Log(LogLevel::ERROR, message); }
+void Logger::Error(const std::string& message) { Log(LogLevel::ERROR_LEVEL, message); }
 void Logger::Debug(const std::string& message) { Log(LogLevel::DEBUG, message); }
 
 } // namespace rbft

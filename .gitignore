@@ -12,3 +12,8 @@ data/*/node.pub
 *.exe
 __pycache__/
 .pytest_cache/
+node_modules/
+npm-cache/
+frontend/node_modules/
+frontend/dist/
+frontend/.vite/

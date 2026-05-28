@@ -28,8 +28,11 @@ list(FILTER RBFT_SOURCES EXCLUDE REGEX ".*/main\\.cpp$")
 
 add_library(rbft_core ${RBFT_SOURCES})
 target_include_directories(rbft_core PUBLIC include ${SODIUM_INCLUDE_DIRS} ${SQLITE3_INCLUDE_DIRS})
+target_link_directories(rbft_core PUBLIC ${SODIUM_LIBRARY_DIRS} ${SQLITE3_LIBRARY_DIRS})
 target_link_libraries(rbft_core PUBLIC nlohmann_json::nlohmann_json httplib::httplib ${SODIUM_LIBRARIES} ${SQLITE3_LIBRARIES})
-target_compile_options(rbft_core PRIVATE -Wall -Wextra -Wpedantic)
+target_compile_options(rbft_core PRIVATE
+  $<$<CXX_COMPILER_ID:MSVC>:/W4>
+  $<$<NOT:$<CXX_COMPILER_ID:MSVC>>:-Wall -Wextra -Wpedantic>)
 
 add_executable(rbft_node src/main.cpp)
 target_link_libraries(rbft_node PRIVATE rbft_core)

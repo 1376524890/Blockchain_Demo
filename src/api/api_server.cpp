@@ -3,9 +3,104 @@
 #include "common/logger.h"
 #include "crypto/crypto_utils.h"
 
+#include <algorithm>
 #include <filesystem>
+#include <sstream>
 
 namespace rbft {
+
+namespace {
+
+bool HasRequiredFields(const nlohmann::json& j, const std::vector<std::string>& fields, std::string& missing) {
+    for (const auto& field : fields) {
+        if (!j.contains(field) || j.at(field).is_null()) {
+            missing = field;
+            return false;
+        }
+    }
+    return true;
+}
+
+bool HashBit(const Hash& key, size_t depth) {
+    const size_t byte_index = depth / 8;
+    const size_t bit_index = 7 - (depth % 8);
+    return ((key[byte_index] >> bit_index) & 1U) == 1U;
+}
+
+std::string PathBits(const Hash& key, size_t begin, size_t count) {
+    std::string bits;
+    bits.reserve(count);
+    for (size_t i = begin; i < begin + count && i < 256; ++i) {
+        bits.push_back(HashBit(key, i) ? '1' : '0');
+    }
+    return bits;
+}
+
+nlohmann::json ProofToJson(const std::vector<MerkleProofItem>& proof) {
+    nlohmann::json items = nlohmann::json::array();
+    for (const auto& item : proof) {
+        items.push_back({{"position", item.position == MerkleProofItem::Position::LEFT ? "LEFT" : "RIGHT"},
+                         {"hash", HashToHex(item.sibling_hash)}});
+    }
+    return items;
+}
+
+nlohmann::json MerkleRecomputeSteps(const Transaction& tx, const std::vector<MerkleProofItem>& proof, Hash& computed_root) {
+    nlohmann::json steps = nlohmann::json::array();
+    Hash current = MerkleTree::LeafHash(tx);
+    for (size_t level = 0; level < proof.size(); ++level) {
+        const auto& item = proof[level];
+        const auto before = current;
+        if (item.position == MerkleProofItem::Position::LEFT) {
+            current = MerkleTree::ParentHash(item.sibling_hash, current);
+            steps.push_back({{"level", level},
+                             {"position", "LEFT"},
+                             {"current_before", HashToHex(before)},
+                             {"sibling", HashToHex(item.sibling_hash)},
+                             {"concat_order", "sibling || current"},
+                             {"parent", HashToHex(current)}});
+        } else {
+            current = MerkleTree::ParentHash(current, item.sibling_hash);
+            steps.push_back({{"level", level},
+                             {"position", "RIGHT"},
+                             {"current_before", HashToHex(before)},
+                             {"sibling", HashToHex(item.sibling_hash)},
+                             {"concat_order", "current || sibling"},
+                             {"parent", HashToHex(current)}});
+        }
+    }
+    computed_root = current;
+    return steps;
+}
+
+nlohmann::json SMTRecomputeSteps(const Hash& key, Hash current, const SMTProof& proof, Hash& computed_root) {
+    nlohmann::json steps = nlohmann::json::array();
+    for (size_t depth = 255; depth < 256; --depth) {
+        const auto& sibling = proof.sibling_hashes[255 - depth];
+        const auto before = current;
+        const bool bit = HashBit(key, depth);
+        if (bit) {
+            current = SparseMerkleTree::ParentHash(sibling, current);
+            steps.push_back({{"level", depth}, {"bit", 1}, {"direction", "RIGHT"},
+                             {"current_before", HashToHex(before)}, {"sibling", HashToHex(sibling)},
+                             {"concat_order", "sibling || current"}, {"parent", HashToHex(current)}});
+        } else {
+            current = SparseMerkleTree::ParentHash(current, sibling);
+            steps.push_back({{"level", depth}, {"bit", 0}, {"direction", "LEFT"},
+                             {"current_before", HashToHex(before)}, {"sibling", HashToHex(sibling)},
+                             {"concat_order", "current || sibling"}, {"parent", HashToHex(current)}});
+        }
+    }
+    computed_root = current;
+    return steps;
+}
+
+nlohmann::json TransactionSummaryJson(const Transaction& tx) {
+    return {{"tx_id", tx.tx_id}, {"type", tx.type}, {"from", tx.from}, {"to", tx.to},
+            {"amount", tx.amount}, {"nonce", tx.nonce}};
+}
+
+} // namespace
 
 ApiServer::ApiServer(NodeConfig config)
     : config_(std::move(config)),
@@ -31,10 +126,20 @@ nlohmann::json ApiServer::Err(const std::string& error) const {
 
 void ApiServer::ReplyJson(httplib::Response& res, int status, const nlohmann::json& body) const {
     res.status = status;
+    res.set_header("Access-Control-Allow-Origin", "*");
+    res.set_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
+    res.set_header("Access-Control-Allow-Headers", "Content-Type, Authorization");
     res.set_content(body.dump(), "application/json; charset=utf-8");
 }
 
 void ApiServer::RegisterRoutes(httplib::Server& server) {
+    server.Options(R"((.*))", [](const httplib::Request&, httplib::Response& res) {
+        res.status = 204;
+        res.set_header("Access-Control-Allow-Origin", "*");
+        res.set_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
+        res.set_header("Access-Control-Allow-Headers", "Content-Type, Authorization");
+    });
+
     server.Get("/api/node/status", [this](const httplib::Request&, httplib::Response& res) {
         ReplyJson(res, 200, Ok({
             {"node_id", config_.node_id},
@@ -55,6 +160,19 @@ void ApiServer::RegisterRoutes(httplib::Server& server) {
 
     server.Get("/api/node/consensus", [this](const httplib::Request&, httplib::Response& res) {
         ReplyJson(res, 200, Ok(consensus_.Status()));
+    });
+
+    server.Get("/api/node/consensus/events", [this](const httplib::Request& req, httplib::Response& res) {
+        size_t limit = 100;
+        if (req.has_param("limit")) {
+            limit = static_cast<size_t>(std::stoull(req.get_param_value("limit")));
+        }
+        limit = std::min(limit, static_cast<size_t>(1000));
+        nlohmann::json arr = nlohmann::json::array();
+        for (const auto& event : consensus_.RecentEvents(limit)) {
+            arr.push_back(ConsensusEventToJson(event));
+        }
+        ReplyJson(res, 200, Ok(arr));
     });
 
     server.Post("/api/admin/attack-mode", [this](const httplib::Request& req, httplib::Response& res) {
@@ -111,6 +229,34 @@ void ApiServer::RegisterRoutes(httplib::Server& server) {
                                {"public_key", u->public_key_hex}, {"account", account ? nlohmann::json{{"balance", account->balance}, {"nonce", account->nonce}} : nlohmann::json(nullptr)}}));
     });
 
+    server.Post("/api/debug/tx/serialize", [this](const httplib::Request& req, httplib::Response& res) {
+        try {
+            auto j = nlohmann::json::parse(req.body);
+            std::string missing;
+            const std::vector<std::string> fields{"type", "from", "to", "amount", "data_hash", "nonce", "timestamp", "public_key"};
+            if (!HasRequiredFields(j, fields, missing)) {
+                ReplyJson(res, 400, Err("missing field: " + missing));
+                return;
+            }
+            Transaction tx;
+            tx.type = j.at("type").get<std::string>();
+            tx.from = j.at("from").get<std::string>();
+            tx.to = j.at("to").get<std::string>();
+            tx.amount = j.at("amount").get<uint64_t>();
+            tx.data_hash = j.at("data_hash").get<std::string>();
+            tx.nonce = j.at("nonce").get<uint64_t>();
+            tx.timestamp = j.at("timestamp").get<uint64_t>();
+            tx.public_key_hex = j.at("public_key").get<std::string>();
+            const auto tx_body = SerializeTransactionBody(tx);
+            ReplyJson(res, 200, Ok({{"tx_body", tx_body},
+                                   {"body_hash", crypto::Sha256Hex(tx_body)},
+                                   {"field_order", fields},
+                                   {"note", "tx_id and signature are excluded from tx_body"}}));
+        } catch (const std::exception& e) {
+            ReplyJson(res, 400, Err(e.what()));
+        }
+    });
+
     auto add_tx = [this](const httplib::Request& req, httplib::Response& res, const std::string& type) {
         try {
             auto j = nlohmann::json::parse(req.body);
@@ -137,6 +283,7 @@ void ApiServer::RegisterRoutes(httplib::Server& server) {
                 ReplyJson(res, 400, Err(error));
                 return;
             }
+            consensus_.AddEvent({0, 0, "", 0, 0, 0, "MEMPOOL_ADD", tx.from, config_.node_id, tx.tx_id, true, "", ""});
             storage_.PutTransaction(tx, "PENDING", std::nullopt, std::nullopt);
             if (consensus_.IsRunning() && consensus_.GetAttackMode() == AttackMode::NORMAL) {
                 auto picked = mempool_.PickTransactions(100);
@@ -155,6 +302,8 @@ void ApiServer::RegisterRoutes(httplib::Server& server) {
                 block.header.block_hash = ComputeBlockHash(block.header);
                 // 演示模式下本地自动提交区块；完整 RBFT 网络投票逻辑由 ConsensusEngine/P2P 接口承载。
                 executor_.CommitBlock(block);
+                consensus_.AddEvent({0, 0, "", block.header.height, block.header.view, block.header.instance_id,
+                                     "AUTO_COMMIT_BLOCK", config_.node_id, config_.node_id, block.header.block_hash, true, "", ""});
                 mempool_.RemoveCommitted(picked);
                 ReplyJson(res, 200, Ok({{"tx_id", tx.tx_id}, {"status", "COMMITTED"}, {"block_height", block.header.height}}));
                 return;
@@ -198,6 +347,102 @@ void ApiServer::RegisterRoutes(httplib::Server& server) {
         auto block = storage_.GetBlockByHash(req.matches[1]);
         if (!block) ReplyJson(res, 404, Err("block not found"));
         else ReplyJson(res, 200, Ok(BlockToJson(*block)));
+    });
+
+    server.Get(R"(/api/debug/block/(\d+)/trace)", [this](const httplib::Request& req, httplib::Response& res) {
+        auto block = storage_.GetBlockByHeight(std::stoull(req.matches[1]));
+        if (!block) {
+            ReplyJson(res, 404, Err("block not found"));
+            return;
+        }
+        nlohmann::json txs = nlohmann::json::array();
+        for (const auto& tx : block->transactions) {
+            txs.push_back(TransactionSummaryJson(tx));
+        }
+        ReplyJson(res, 200, Ok({{"height", block->header.height},
+                               {"previous_block_hash", block->header.previous_block_hash},
+                               {"transactions", txs},
+                               {"tx_merkle_root", block->header.tx_merkle_root},
+                               {"state_root", block->header.state_root},
+                               {"block_header_serialized", SerializeBlockHeaderForHash(block->header)},
+                               {"block_hash", block->header.block_hash},
+                               {"view", block->header.view},
+                               {"instance_id", block->header.instance_id},
+                               {"proposer_id", block->header.proposer_id}}));
+    });
+
+    server.Get(R"(/api/debug/merkle/block/(\d+))", [this](const httplib::Request& req, httplib::Response& res) {
+        auto block = storage_.GetBlockByHeight(std::stoull(req.matches[1]));
+        if (!block) {
+            ReplyJson(res, 404, Err("block not found"));
+            return;
+        }
+        auto levels_hashes = MerkleTree::BuildLevels(block->transactions);
+        nlohmann::json levels = nlohmann::json::array();
+        for (size_t level = 0; level < levels_hashes.size(); ++level) {
+            nlohmann::json nodes = nlohmann::json::array();
+            for (size_t i = 0; i < levels_hashes[level].size(); ++i) {
+                nlohmann::json node{{"index", i}, {"hash", HashToHex(levels_hashes[level][i])}};
+                if (level == 0) {
+                    node["source"] = i < block->transactions.size() ? block->transactions[i].tx_id : "";
+                    node["node_type"] = "leaf";
+                } else {
+                    const auto& prev = levels_hashes[level - 1];
+                    const size_t left_index = i * 2;
+                    const size_t right_index = std::min(left_index + 1, prev.size() - 1);
+                    node["left"] = HashToHex(prev[left_index]);
+                    node["right"] = HashToHex(prev[right_index]);
+                    node["node_type"] = "internal";
+                    if (right_index == left_index) {
+                        node["duplicated"] = true;
+                    }
+                }
+                nodes.push_back(node);
+            }
+            levels.push_back(nodes);
+        }
+        ReplyJson(res, 200, Ok({{"height", block->header.height},
+                               {"tx_merkle_root", block->header.tx_merkle_root},
+                               {"tx_count", block->transactions.size()},
+                               {"levels", levels},
+                               {"odd_duplicate_rule", "if a level has odd node count, duplicate the last hash"},
+                               {"leaf_rule", "Hash(0x00 || serialized_transaction)"},
+                               {"internal_rule", "Hash(0x01 || left_hash || right_hash)"}}));
+    });
+
+    server.Get(R"(/api/debug/merkle/tx/([0-9a-fA-F]+))", [this](const httplib::Request& req, httplib::Response& res) {
+        auto tx = storage_.GetTransaction(req.matches[1]);
+        auto height = storage_.GetTransactionBlockHeight(req.matches[1]);
+        if (!tx || !height) {
+            ReplyJson(res, 404, Err("committed transaction not found"));
+            return;
+        }
+        auto block = storage_.GetBlockByHeight(*height);
+        if (!block) {
+            ReplyJson(res, 404, Err("block not found"));
+            return;
+        }
+        size_t index = 0;
+        for (; index < block->transactions.size(); ++index) {
+            if (block->transactions[index].tx_id == tx->tx_id) break;
+        }
+        if (index >= block->transactions.size()) {
+            ReplyJson(res, 404, Err("transaction not found in block"));
+            return;
+        }
+        auto proof = MerkleTree::GenerateProof(block->transactions, index);
+        Hash computed{};
+        auto steps = MerkleRecomputeSteps(*tx, proof, computed);
+        ReplyJson(res, 200, Ok({{"tx_id", tx->tx_id},
+                               {"block_height", *height},
+                               {"tx_index", index},
+                               {"tx", TransactionToJson(*tx)},
+                               {"leaf_hash", HashToHex(MerkleTree::LeafHash(*tx))},
+                               {"expected_root", block->header.tx_merkle_root},
+                               {"proof", ProofToJson(proof)},
+                               {"recompute_steps", steps},
+                               {"computed_root", HashToHex(computed)},
+                               {"valid", HashToHex(computed) == block->header.tx_merkle_root}}));
     });
 
     server.Get(R"(/api/proofs/tx/([0-9a-fA-F]+))", [this](const httplib::Request& req, httplib::Response& res) {
@@ -273,6 +518,61 @@ void ApiServer::RegisterRoutes(httplib::Server& server) {
         ReplyJson(res, 200, Ok({{"root", HashToHex(smt.GetRoot())}, {"key", HashToHex(key)}, {"siblings", siblings}}));
     });
 
+    server.Get(R"(/api/debug/smt/([0-9a-fA-F]+))", [this](const httplib::Request& req, httplib::Response& res) {
+        auto account = storage_.GetAccount(req.matches[1]);
+        if (!account) {
+            ReplyJson(res, 404, Err("account not found"));
+            return;
+        }
+        SparseMerkleTree smt;
+        auto key = crypto::Sha256String(account->address);
+        auto value = EncodeAccountState(*account);
+        smt.Update(key, value);
+        auto proof = smt.GenerateExistenceProof(key);
+        nlohmann::json siblings = nlohmann::json::array();
+        for (const auto& h : proof.sibling_hashes) siblings.push_back(HashToHex(h));
+        Hash computed{};
+        auto value_hash = crypto::Sha256(value);
+        auto steps = SMTRecomputeSteps(key, SparseMerkleTree::LeafHash(key, value_hash), proof, computed);
+        const auto root = smt.GetRoot();
+        ReplyJson(res, 200, Ok({{"address", account->address},
+                               {"key", HashToHex(key)},
+                               {"path_bits_prefix", PathBits(key, 0, 8)},
+                               {"path_bits_suffix", PathBits(key, 248, 8)},
+                               {"value", SerializeAccountState(*account)},
+                               {"value_hash", HashToHex(value_hash)},
+                               {"root", HashToHex(root)},
+                               {"proof_type", "EXISTENCE"},
+                               {"siblings", siblings},
+                               {"recompute_steps", steps},
+                               {"computed_root", HashToHex(computed)},
+                               {"valid", computed == root},
+                               {"note", "Current SMT proof is demonstration-oriented unless global SMT persistence is enabled."}}));
+    });
+
+    server.Get(R"(/api/debug/smt/([0-9a-fA-F]+)/non-existence)", [this](const httplib::Request& req, httplib::Response& res) {
+        SparseMerkleTree smt;
+        auto key = crypto::Sha256String(req.matches[1]);
+        auto proof = smt.GenerateNonExistenceProof(key);
+        nlohmann::json siblings = nlohmann::json::array();
+        for (const auto& h : proof.sibling_hashes) siblings.push_back(HashToHex(h));
+        Hash current = proof.has_collision ? SparseMerkleTree::LeafHash(proof.collision_leaf_key, proof.collision_leaf_value_hash)
+                                           : crypto::Sha256String("SMT_EMPTY_LEAF");
+        Hash computed{};
+        auto steps = SMTRecomputeSteps(key, current, proof, computed);
+        const auto root = smt.GetRoot();
+        ReplyJson(res, 200, Ok({{"address", req.matches[1].str()},
+                               {"key", HashToHex(key)},
+                               {"root", HashToHex(root)},
+                               {"proof_type", "NON_EXISTENCE"},
+                               {"siblings", siblings},
+                               {"collision_leaf", nullptr},
+                               {"recompute_steps", steps},
+                               {"computed_root", HashToHex(computed)},
+                               {"valid", SparseMerkleTree::VerifyNonExistenceProof(root, key, proof)},
+                               {"note", "Current SMT proof is demonstration-oriented unless global SMT persistence is enabled."}}));
+    });
+
     server.Post("/api/state/proof/verify", [this](const httplib::Request& req, httplib::Response& res) {
         try {
             auto j = nlohmann::json::parse(req.body);
@@ -306,8 +606,14 @@ void ApiServer::RegisterRoutes(httplib::Server& server) {
     server.Post("/p2p/consensus/message", [this](const httplib::Request& req, httplib::Response& res) {
         try {
             auto msg = ConsensusMessageFromJson(nlohmann::json::parse(req.body));
+            consensus_.AddEvent({0, 0, "", msg.height, msg.view, msg.instance_id, "P2P_MESSAGE_RECEIVED",
+                                 msg.sender_id, config_.node_id, msg.block_hash, true, "", ""});
             std::string evidence;
             bool accepted = consensus_.RecordVote(msg, evidence);
+            if (!accepted) {
+                consensus_.AddEvent({0, 0, "", msg.height, msg.view, msg.instance_id, "RECORD_VOTE_REJECTED",
+                                     msg.sender_id, config_.node_id, msg.block_hash, false, evidence, ""});
+            }
             ReplyJson(res, accepted ? 200 : 409, accepted ? Ok({{"accepted", true}}) : Err(evidence));
         } catch (const std::exception& e) {
             ReplyJson(res, 400, Err(e.what()));

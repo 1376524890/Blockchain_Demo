@@ -1,0 +1,54 @@
+.app-shell { min-height: 100vh; background: radial-gradient(circle at top left, rgba(0, 174, 255, .12), transparent 34%), #071018; }
+.side { padding: 22px; border-right: 1px solid rgba(148, 163, 184, .18); background: rgba(4, 11, 18, .86); }
+.side h1 { margin: 0 0 18px; font-size: 20px; letter-spacing: 0; }
+.node-select { width: 100%; margin-bottom: 20px; }
+nav { display: grid; gap: 8px; }
+nav a { padding: 10px 12px; border-radius: 8px; color: #9fb5cc; }
+nav a.router-link-active { background: #0f766e; color: white; }
+.page { display: grid; gap: 18px; }
+.page-title { display: flex; align-items: flex-end; justify-content: space-between; gap: 16px; }
+.page-title h2 { margin: 0; font-size: 28px; }
+.muted { color: #94a3b8; }
+.grid-2 { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 16px; }
+.grid-3 { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 16px; }
+.panel, .node-card, .debug-step { border: 1px solid rgba(148, 163, 184, .18); border-radius: 8px; background: rgba(15, 23, 42, .76); padding: 16px; box-shadow: 0 18px 40px rgba(0,0,0,.18); }
+.panel h3 { margin: 0 0 12px; font-size: 16px; }
+.panel-head, .step-head, .row { display: flex; align-items: center; justify-content: space-between; gap: 10px; }
+.form-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px 16px; }
+.kv { display: grid; grid-template-columns: 160px minmax(0, 1fr); gap: 12px; align-items: start; margin: 8px 0; }
+.kv span { color: #94a3b8; }
+.hash-text { width: 100%; border: 0; background: transparent; color: #67e8f9; text-align: left; overflow-wrap: anywhere; cursor: pointer; }
+.code-box { position: relative; margin-top: 10px; }
+.code-box pre { max-height: 360px; overflow: auto; padding: 14px; border-radius: 8px; background: #020617; color: #c4b5fd; }
+.copy-btn { position: absolute; right: 8px; top: 8px; border: 1px solid #334155; background: #0f172a; color: #dbeafe; border-radius: 6px; padding: 4px 8px; }
+.node-card { display: grid; gap: 6px; color: #dcfce7; text-align: left; border-color: rgba(34, 197, 94, .34); }
+.node-card.attack { color: #fecaca; border-color: rgba(239, 68, 68, .55); }
+.node-card.stopped { color: #cbd5e1; border-color: rgba(148, 163, 184, .4); }
+.node-card.selected { outline: 2px solid #38bdf8; }
+.topology { min-height: 260px; display: grid; grid-template-columns: repeat(2, 1fr); gap: 28px; place-items: center; }
+.topology-node { width: 120px; height: 72px; display: grid; place-items: center; border: 1px solid #38bdf8; border-radius: 8px; background: #082f49; }
+.topology-node.selected { background: #0f766e; }
+.debug-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; }
+.debug-step.success { border-color: rgba(34, 197, 94, .38); }
+.debug-step.error { border-color: rgba(239, 68, 68, .56); }
+.badge { padding: 2px 8px; border-radius: 999px; background: #1e293b; color: #67e8f9; }
+.tree-graph, .proof-graph, .rbft-flow { display: grid; gap: 12px; overflow: auto; }
+.tree-level { display: flex; gap: 10px; align-items: center; min-width: max-content; }
+.level-label { width: 42px; color: #94a3b8; }
+.tree-node, .proof-step, .event-pill { border: 1px solid #334155; border-radius: 8px; padding: 10px; background: #0b1220; display: grid; gap: 6px; }
+.tree-node.proof { border-color: #22c55e; }
+.tree-node.duplicated { border-style: dashed; }
+.event-pill { grid-template-columns: 180px 1fr 120px; align-items: center; }
+.event-pill.prepare { border-color: #facc15; }
+.event-pill.commit, .event-pill.auto_commit_block { border-color: #22c55e; }
+.event-pill.pre_prepare { border-color: #38bdf8; }
+.event-pill.conflicting_vote, .event-pill.record_vote_rejected { border-color: #ef4444; }
+.danger-panel { border-color: rgba(239, 68, 68, .55); }
+.metric-grid { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 12px; }
+.metric-grid div { background: #0b1220; border-radius: 8px; padding: 12px; display: grid; gap: 6px; }
+@media (max-width: 920px) {
+  .app-shell { display: block; }
+  .side { width: 100% !important; }
+  .grid-2, .grid-3, .form-grid, .debug-grid { grid-template-columns: 1fr; }
+  .kv { grid-template-columns: 1fr; }
+}

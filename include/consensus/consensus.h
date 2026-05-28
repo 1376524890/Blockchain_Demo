@@ -42,11 +42,28 @@ struct ConsensusMessage {
     std::string signature_hex;
 };
 
+struct ConsensusEvent {
+    uint64_t id{};
+    uint64_t timestamp{};
+    std::string node_id;
+    uint64_t height{};
+    uint64_t view{};
+    uint32_t instance_id{};
+    std::string event_type;
+    std::string from;
+    std::string to;
+    std::string block_hash;
+    bool accepted{true};
+    std::string reason;
+    std::string attack_mode;
+};
+
 std::string AttackModeToString(AttackMode mode);
 AttackMode AttackModeFromString(const std::string& mode);
 std::string SerializeConsensusMessageForSign(const ConsensusMessage& msg);
 nlohmann::json ConsensusMessageToJson(const ConsensusMessage& msg);
 ConsensusMessage ConsensusMessageFromJson(const nlohmann::json& j);
+nlohmann::json ConsensusEventToJson(const ConsensusEvent& event);
 
 class ConsensusEngine {
 public:
@@ -60,6 +77,8 @@ public:
     void Stop();
     void Start();
     bool RecordVote(const ConsensusMessage& msg, std::string& evidence);
+    void AddEvent(ConsensusEvent event);
+    std::vector<ConsensusEvent> RecentEvents(size_t limit) const;
     nlohmann::json Status() const;
 
 private:
@@ -71,6 +90,8 @@ private:
     CustomHashTable<std::string, std::string> prepare_votes_{128};
     CustomHashTable<std::string, std::string> commit_votes_{128};
     std::vector<nlohmann::json> evidence_;
+    std::vector<ConsensusEvent> events_;
+    uint64_t next_event_id_{1};
 };
 
 } // namespace rbft

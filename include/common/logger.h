@@ -5,7 +5,7 @@
 
 namespace rbft {
 
-enum class LogLevel { INFO, WARN, ERROR, DEBUG };
+enum class LogLevel { INFO, WARN, ERROR_LEVEL, DEBUG };
 
 class Logger {
 public:

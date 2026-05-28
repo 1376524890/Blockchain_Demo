@@ -1,5 +1,26 @@
 # RBFT Chain Demo
 
+## Frontend Debug Demo APIs
+
+The demo frontend uses REST/P2P routes on the REST ports only:
+
+- node1: `http://127.0.0.1:8001`
+- node2: `http://127.0.0.1:8002`
+- node3: `http://127.0.0.1:8003`
+- node4: `http://127.0.0.1:8004`
+
+New visualization endpoints:
+
+- `POST /api/debug/tx/serialize`
+- `GET /api/debug/merkle/block/{height}`
+- `GET /api/debug/merkle/tx/{tx_id}`
+- `GET /api/debug/smt/{address}`
+- `GET /api/debug/smt/{address}/non-existence`
+- `GET /api/node/consensus/events?limit=100`
+- `GET /api/debug/block/{height}/trace`
+
+These routes keep the existing response envelope and are intended for algorithm debugging: tx signing body, hashes, signatures, Merkle proof/root recomputation, SMT proof/root recomputation, RBFT event timelines, and attack-mode demonstrations. The current P2P routes are served on the same REST port in this demo.
+
 本项目是一个 C++17 联盟链演示系统，支持 4 个本地节点、REST API、SQLite 持久化、libsodium 密码学、手写 Merkle Tree、手写 Sparse Merkle Tree、手写 HashTable 和简化 RBFT 共识。
 
 ## 功能
