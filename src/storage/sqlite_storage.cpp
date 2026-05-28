@@ -116,6 +116,19 @@ std::optional<Transaction> SQLiteStorage::GetTransaction(const std::string& tx_i
     return tx;
 }
 
+std::optional<uint64_t> SQLiteStorage::GetTransactionBlockHeight(const std::string& tx_id) const {
+    sqlite3_stmt* stmt = nullptr;
+    sqlite3_prepare_v2(db_, "SELECT block_height FROM transactions WHERE tx_id=? AND block_height IS NOT NULL;", -1, &stmt, nullptr);
+    sqlite3_bind_text(stmt, 1, tx_id.c_str(), -1, SQLITE_TRANSIENT);
+    if (sqlite3_step(stmt) != SQLITE_ROW) {
+        sqlite3_finalize(stmt);
+        return std::nullopt;
+    }
+    uint64_t height = static_cast<uint64_t>(sqlite3_column_int64(stmt, 0));
+    sqlite3_finalize(stmt);
+    return height;
+}
+
 void SQLiteStorage::PutBlock(const Block& block) {
     sqlite3_stmt* stmt = nullptr;
     const char* sql = "INSERT OR REPLACE INTO blocks(height,block_hash,previous_block_hash,tx_merkle_root,state_root,timestamp,view,instance_id,proposer_id,block_json) VALUES(?,?,?,?,?,?,?,?,?,?);";
@@ -142,6 +155,19 @@ std::optional<Block> SQLiteStorage::GetBlockByHeight(uint64_t height) const {
     sqlite3_stmt* stmt = nullptr;
     sqlite3_prepare_v2(db_, "SELECT block_json FROM blocks WHERE height=?;", -1, &stmt, nullptr);
     sqlite3_bind_int64(stmt, 1, static_cast<sqlite3_int64>(height));
+    if (sqlite3_step(stmt) != SQLITE_ROW) {
+        sqlite3_finalize(stmt);
+        return std::nullopt;
+    }
+    auto block = BlockFromJson(nlohmann::json::parse(reinterpret_cast<const char*>(sqlite3_column_text(stmt, 0))));
+    sqlite3_finalize(stmt);
+    return block;
+}
+
+std::optional<Block> SQLiteStorage::GetBlockByHash(const std::string& block_hash) const {
+    sqlite3_stmt* stmt = nullptr;
+    sqlite3_prepare_v2(db_, "SELECT block_json FROM blocks WHERE block_hash=?;", -1, &stmt, nullptr);
+    sqlite3_bind_text(stmt, 1, block_hash.c_str(), -1, SQLITE_TRANSIENT);
     if (sqlite3_step(stmt) != SQLITE_ROW) {
         sqlite3_finalize(stmt);
         return std::nullopt;

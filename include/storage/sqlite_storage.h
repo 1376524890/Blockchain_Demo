@@ -25,8 +25,10 @@ public:
     std::optional<AccountState> GetAccount(const std::string& address) const;
     void PutTransaction(const Transaction& tx, const std::string& status, std::optional<uint64_t> height, std::optional<uint64_t> index);
     std::optional<Transaction> GetTransaction(const std::string& tx_id) const;
+    std::optional<uint64_t> GetTransactionBlockHeight(const std::string& tx_id) const;
     void PutBlock(const Block& block);
     std::optional<Block> GetBlockByHeight(uint64_t height) const;
+    std::optional<Block> GetBlockByHash(const std::string& block_hash) const;
     std::optional<Block> GetLatestBlock() const;
     void PutMetadata(const std::string& key, const std::string& value);
     std::string GetMetadata(const std::string& key, const std::string& fallback = "") const;
