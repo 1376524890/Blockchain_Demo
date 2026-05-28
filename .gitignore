@@ -12,6 +12,8 @@ data/*/node.pub
 *.exe
 __pycache__/
 .pytest_cache/
+.vs/
+CMakeSettings.json
 node_modules/
 npm-cache/
 frontend/node_modules/
