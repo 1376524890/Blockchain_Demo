@@ -1,3 +1,4 @@
+#include "api/api_server.h"
 #include "common/config.h"
 #include "common/logger.h"
 
@@ -23,10 +24,13 @@ int main(int argc, char** argv) {
         rbft::Logger::Info("starting " + cfg.node_id + " rest=" + std::to_string(cfg.rest_port) +
                            " p2p=" + std::to_string(cfg.p2p_port));
         if (init_db_only) {
-            rbft::Logger::Info("database initialization requested; storage module is loaded in later phases");
+            rbft::ApiServer app(cfg);
+            app.InitDbOnly();
+            rbft::Logger::Info("database initialized");
             return 0;
         }
-        rbft::Logger::Info("stage 2 node skeleton is running; API server is added in later phases");
+        rbft::ApiServer app(cfg);
+        app.Run();
         return 0;
     } catch (const std::exception& e) {
         std::cerr << "fatal: " << e.what() << "\n";

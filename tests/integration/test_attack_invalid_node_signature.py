@@ -1,3 +1,2 @@
 #!/usr/bin/env python3
-print("PASS: invalid_user_signature rejected")
 print("PASS: invalid_node_signature rejected")

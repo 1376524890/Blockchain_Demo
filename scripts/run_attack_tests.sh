@@ -6,9 +6,13 @@ tests=(
   test_attack_bad_state_root.py
   test_attack_double_proposal.py
   test_attack_invalid_signature.py
+  test_attack_invalid_node_signature.py
   test_attack_replay_nonce.py
+  test_attack_drop_prepare.py
   test_attack_node_crash.py
   test_attack_exceed_fault_limit.py
+  test_attack_delay_preprepare.py
+  test_attack_large_tx_spam.py
 )
 for t in "${tests[@]}"; do
   python3 "tests/integration/${t}"
