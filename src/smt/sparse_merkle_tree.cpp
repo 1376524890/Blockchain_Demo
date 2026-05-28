@@ -83,8 +83,11 @@ SMTProof SparseMerkleTree::GenerateNonExistenceProof(const Hash& key) const {
         current = target_right ? right : left;
     }
     proof.sibling_hashes.assign(top_down.rbegin(), top_down.rend());
+    // 仅当目标路径恰好落在已有叶子位置时才设置碰撞（SHA-256 碰撞概率极低）。
     for (const auto& leaf : leaves_) {
-        if (leaf.key != key) {
+        if (leaf.key == key) {
+            // key 存在，不应生成不存在证明，但防御性处理：
+            // 用该叶子作为碰撞叶子。
             proof.has_collision = true;
             proof.collision_leaf_key = leaf.key;
             proof.collision_leaf_value_hash = leaf.value_hash;
@@ -99,13 +102,14 @@ bool SparseMerkleTree::VerifyExistenceProof(const Hash& root, const Hash& key, c
         return false;
     }
     // 从目标叶子开始，按 key 的路径方向和 sibling 列表逐层还原根。
+    // sibling_hashes[depth] 对应 depth 层的 sibling，从 depth=255 向上到 depth=0。
     Hash current = LeafHash(key, crypto::Sha256(value));
-    for (size_t i = 0; i < proof.sibling_hashes.size(); ++i) {
-        const size_t depth = 255 - i;
+    for (size_t depth = 255; depth < 256; --depth) {
+        const auto& sibling = proof.sibling_hashes[255 - depth];
         if (GetBit(key, depth)) {
-            current = ParentHash(proof.sibling_hashes[i], current);
+            current = ParentHash(sibling, current);
         } else {
-            current = ParentHash(current, proof.sibling_hashes[i]);
+            current = ParentHash(current, sibling);
         }
     }
     return current == root;
@@ -117,12 +121,12 @@ bool SparseMerkleTree::VerifyNonExistenceProof(const Hash& root, const Hash& key
     }
     Hash current = proof.has_collision ? LeafHash(proof.collision_leaf_key, proof.collision_leaf_value_hash)
                                        : crypto::Sha256String("SMT_EMPTY_LEAF");
-    for (size_t i = 0; i < proof.sibling_hashes.size(); ++i) {
-        const size_t depth = 255 - i;
+    for (size_t depth = 255; depth < 256; --depth) {
+        const auto& sibling = proof.sibling_hashes[255 - depth];
         if (GetBit(key, depth)) {
-            current = ParentHash(proof.sibling_hashes[i], current);
+            current = ParentHash(sibling, current);
         } else {
-            current = ParentHash(current, proof.sibling_hashes[i]);
+            current = ParentHash(current, sibling);
         }
     }
     return current == root && (!proof.has_collision || proof.collision_leaf_key != key);
@@ -157,7 +161,7 @@ Hash SparseMerkleTree::ComputeRootForLeaves(const std::vector<Leaf>& leaves, siz
     if (leaves.empty()) {
         return DefaultHash(depth);
     }
-    if (depth == 256 || leaves.size() == 1) {
+    if (depth == 256) {
         return LeafHash(leaves.front().key, leaves.front().value_hash);
     }
 
