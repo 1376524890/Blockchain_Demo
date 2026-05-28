@@ -1,0 +1,14 @@
+build/
+data/*/*.db
+data/*/*.db-*
+data/*/*.log
+data/*/*.pid
+data/*/node.key
+data/*/node.pub
+*.o
+*.a
+*.so
+*.dylib
+*.exe
+__pycache__/
+.pytest_cache/

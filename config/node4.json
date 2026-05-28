@@ -1,0 +1,18 @@
+{
+  "node_id": "node4",
+  "rest_port": 8004,
+  "p2p_port": 9004,
+  "db_path": "data/node4/chain.db",
+  "node_private_key_path": "data/node4/node.key",
+  "node_public_key": "",
+  "chain_id": "rbft-demo-chain",
+  "f": 1,
+  "instance_count": 2,
+  "block_interval_ms": 1500,
+  "consensus_timeout_ms": 5000,
+  "peers": [
+    {"node_id": "node1", "host": "127.0.0.1", "rest_port": 8001, "p2p_port": 9001, "public_key": ""},
+    {"node_id": "node2", "host": "127.0.0.1", "rest_port": 8002, "p2p_port": 9002, "public_key": ""},
+    {"node_id": "node3", "host": "127.0.0.1", "rest_port": 8003, "p2p_port": 9003, "public_key": ""}
+  ]
+}
