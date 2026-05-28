@@ -1,0 +1,13 @@
+flowchart LR
+    REST[REST API] --> Node[Node Core]
+    P2P[P2P API] --> Consensus[Consensus Engine]
+    Node --> Users[User Manager]
+    Node --> Mempool[Mempool]
+    Node --> Executor[Block Executor]
+    Consensus --> Executor
+    Executor --> Merkle[Merkle Tree]
+    Executor --> SMT[Sparse Merkle Tree]
+    Users --> Store[(SQLite)]
+    Mempool --> Store
+    Executor --> Store
+    Consensus --> Store

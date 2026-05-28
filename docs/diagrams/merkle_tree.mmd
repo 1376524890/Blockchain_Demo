@@ -1,0 +1,11 @@
+flowchart BT
+    T1[tx1] --> L1[H(0x00||tx1)]
+    T2[tx2] --> L2[H(0x00||tx2)]
+    T3[tx3] --> L3[H(0x00||tx3)]
+    L3 --> L4[duplicate L3]
+    L1 --> P1[H(0x01||L1||L2)]
+    L2 --> P1
+    L3 --> P2[H(0x01||L3||L4)]
+    L4 --> P2
+    P1 --> R[Root]
+    P2 --> R

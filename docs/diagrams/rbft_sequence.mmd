@@ -1,0 +1,20 @@
+sequenceDiagram
+    participant C as Client
+    participant P as Primary
+    participant N2 as Node2
+    participant N3 as Node3
+    participant N4 as Node4
+    C->>P: submit transaction
+    P->>P: build block, merkle root, state root
+    P->>N2: PRE_PREPARE(block)
+    P->>N3: PRE_PREPARE(block)
+    P->>N4: PRE_PREPARE(block)
+    N2->>P: PREPARE
+    N3->>P: PREPARE
+    N4->>P: PREPARE
+    P->>N2: COMMIT
+    P->>N3: COMMIT
+    P->>N4: COMMIT
+    N2->>N2: commit when quorum=3
+    N3->>N3: commit when quorum=3
+    N4->>N4: commit when quorum=3

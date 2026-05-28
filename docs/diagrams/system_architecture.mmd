@@ -1,0 +1,23 @@
+flowchart TB
+    Frontend[Web Frontend / Browser] --> API1[Node1 REST API :8001]
+    Frontend --> API2[Node2 REST API :8002]
+    Frontend --> API3[Node3 REST API :8003]
+    Frontend --> API4[Node4 REST API :8004]
+    API1 --> N1[Node1 Core]
+    API2 --> N2[Node2 Core]
+    API3 --> N3[Node3 Core]
+    API4 --> N4[Node4 Core]
+    N1 <--> P2P1[Node Network :9001]
+    N2 <--> P2P2[Node Network :9002]
+    N3 <--> P2P3[Node Network :9003]
+    N4 <--> P2P4[Node Network :9004]
+    P2P1 <--> P2P2
+    P2P1 <--> P2P3
+    P2P1 <--> P2P4
+    P2P2 <--> P2P3
+    P2P2 <--> P2P4
+    P2P3 <--> P2P4
+    N1 --> DB1[(SQLite node1)]
+    N2 --> DB2[(SQLite node2)]
+    N3 --> DB3[(SQLite node3)]
+    N4 --> DB4[(SQLite node4)]
