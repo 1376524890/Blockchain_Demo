@@ -1,86 +1,100 @@
 #pragma once
 
-#include "block/block_executor.h"
-#include "common/config.h"
-#include "consensus/consensus.h"
-#include "merkle/merkle_tree.h"
-#include "storage/sqlite_storage.h"
-#include "tx/mempool.h"
-#include "user/user_manager.h"
-
-#include "datastructure/custom_hash_table.h"
-
+#include <cstdint>
+#include <filesystem>
 #include <fstream>
 #include <memory>
 #include <string>
 #include <vector>
 
+namespace httplib { class Client; }
+
 namespace rbft {
 
-// 已登录用户会话信息
-struct CliUserSession {
+// 远程节点连接
+struct RemoteNode {
+    std::string node_id;
+    std::string host;
+    int port{};
+    std::unique_ptr<httplib::Client> client;
+};
+
+// 钱包信息 (本地存储)
+struct Wallet {
     std::string username;
     std::string address;
-    std::string public_key_hex;
-    std::string private_key_hex;
+    std::string public_key;
+    std::string private_key;     // 明文 (从加密文件解密后)
+    std::string encrypted_key;   // 加密后的私钥 (存储在文件中)
+};
+
+// 已注册用户 (从远程节点获取)
+struct RemoteUser {
+    std::string username;
+    std::string address;
+    std::string public_key;
+    std::string private_key;
     std::string token;
 };
 
 // 最近交易记录
 struct TxRecord {
     std::string tx_id;
-    std::string type;       // TRANSFER / STORE_DATA
+    std::string type;
     std::string from;
     std::string to;
     uint64_t amount{};
-    uint64_t block_height{};
+    std::string status;     // COMMITTED / PENDING / REJECTED
 };
 
 class CliSession {
 public:
-    explicit CliSession(const NodeConfig& config);
+    explicit CliSession(const std::vector<std::pair<std::string, int>>& node_endpoints);
     ~CliSession();
 
-    // 禁止拷贝
     CliSession(const CliSession&) = delete;
     CliSession& operator=(const CliSession&) = delete;
 
-    // 交互式主循环
     void Run();
 
 private:
-    // ── 菜单操作 ──
+    // ── 菜单 ──
+    void ShowMenu() const;
+
+    // ── 操作 ──
     void DoRegister();
     void DoLogin();
     void DoTransfer();
     void DoStoreData();
-    void ShowMenu() const;
-
-    // ── 查询 ──
     void DoQueryAccount();
     void DoQueryBlock();
     void DoQueryTransaction();
     void DoQueryPending();
-
-    // ── 证明 ──
     void DoMerkleProof();
     void DoSMTProof();
-
-    // ── 攻击模拟 ──
     void DoAttackSimulation();
-
-    // ── 历史记录 ──
-    void DoShowHistory();
-
-    // ── 管理 ──
-    void DoListUsers();
-
-    // ── 系统状态 ──
     void DoNodeStatus();
     void DoConsensusStatus();
+    void DoShowHistory();
+    void DoListUsers();
+    void DoConsensusVerify();
 
-    // ── 辅助: 选择最近交易 ──
-    std::string PickTxId(const std::string& prompt);
+    // ── HTTP 辅助 ──
+    bool HttpGet(int node_idx, const std::string& path, std::string& out_body);
+    bool HttpPost(int node_idx, const std::string& path, const std::string& json_body, std::string& out_body);
+    bool ParseOk(const std::string& body, std::string& out_data, std::string& out_error);
+
+    // ── 多节点广播 ──
+    // 向所有节点发送相同请求, 返回每个节点的响应
+    struct NodeResponse {
+        int node_idx;
+        bool ok;
+        std::string data;
+        std::string error;
+    };
+    std::vector<NodeResponse> BroadcastGet(const std::string& path);
+    std::vector<NodeResponse> BroadcastPost(const std::string& path, const std::string& json_body);
+    NodeResponse SendToNode(int node_idx, const std::string& method, const std::string& path, const std::string& body = "");
 
     // ── 辅助 ──
     std::string PromptLine(const std::string& prompt) const;
@@ -88,33 +102,31 @@ private:
     void PrintOk(const std::string& msg) const;
     void PrintErr(const std::string& msg) const;
     void Pause() const;
+    int PickNode(const std::string& prompt) const;
+
+    // ── 钱包管理 ──
+    void InitWalletDir();
+    bool SaveWallet(const std::string& username, const std::string& password,
+                    const std::string& address, const std::string& public_key, const std::string& private_key);
+    bool LoadWallet(const std::string& username, const std::string& password, Wallet& out);
 
     // ── 调试日志 ──
     void OpenDebugLog();
-    void Dbg(const std::string& msg);          // 仅写入日志文件
-    void DbgPrint(const std::string& msg);     // 同时写入日志文件和终端
+    void Dbg(const std::string& msg);
+    void DbgPrint(const std::string& msg);
     void DbgSep(const std::string& title);
 
-    // ── 提交交易并出块（核心流程，附带详细日志）──
-    bool SubmitAndCommit(Transaction& tx, std::string& out_error);
-
     // ── 内部状态 ──
-    NodeConfig config_;
-    SQLiteStorage storage_;
-    std::unique_ptr<UserManager> users_;
+    std::vector<RemoteNode> nodes_;
+    std::vector<RemoteUser> users_;
+    int active_user_{-1};
 
-    Mempool mempool_;
-    ConsensusEngine consensus_;
-    BlockExecutor executor_;
-
-    std::vector<CliUserSession> logged_in_users_;   // 已登录用户列表
-    int active_user_index_{-1};                      // 当前活跃用户索引
-
-    // 最近交易记录: 哈希表用于 O(1) 按 tx_id 查找, tx_order_ 维护插入顺序用于展示
-    CustomHashTable<std::string, TxRecord> recent_tx_map_{64};
+    std::vector<TxRecord> recent_txs_;
     std::vector<std::string> tx_order_;
 
-    std::ofstream debug_log_;                        // 调试日志文件流
+    std::ofstream debug_log_;
+    std::string log_path_;
+    std::string wallet_dir_;
 };
 
 } // namespace rbft

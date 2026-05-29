@@ -1,10 +1,5 @@
 build/
-data/*/*.db
-data/*/*.db-*
-data/*/*.log
-data/*/*.pid
-data/*/node.key
-data/*/node.pub
+data/
 *.o
 *.a
 *.so
@@ -19,4 +14,11 @@ npm-cache/
 frontend/node_modules/
 frontend/dist/
 frontend/.vite/
-data/
+
+# CMake 构建文件 (防止在根目录误构建)
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+CTestTestfile.cmake
+Makefile
+_deps/

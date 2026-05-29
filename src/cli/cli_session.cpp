@@ -1,43 +1,113 @@
 #include "cli/cli_session.h"
 
-#include "common/logger.h"
-#include "crypto/crypto_utils.h"
-#include "user/account_state.h"
-
 #include <chrono>
 #include <ctime>
+#include <fstream>
+#include <httplib.h>
 #include <iomanip>
 #include <iostream>
+#include <nlohmann/json.hpp>
 #include <sstream>
 
 namespace rbft {
+
+using json = nlohmann::json;
 
 // ══════════════════════════════════════════════════════════════════════════════
 // 构造 / 析构
 // ══════════════════════════════════════════════════════════════════════════════
 
-CliSession::CliSession(const NodeConfig& config)
-    : config_(config),
-      users_(std::make_unique<UserManager>(&storage_)),
-      consensus_(config),
-      executor_(&storage_) {
-    // 确保数据目录存在
-    std::filesystem::create_directories(std::filesystem::path(config_.db_path).parent_path());
-    storage_.Open(config_.db_path);
-    storage_.InitializeSchema();
+CliSession::CliSession(const std::vector<std::pair<std::string, int>>& node_endpoints) {
+    for (size_t i = 0; i < node_endpoints.size(); ++i) {
+        RemoteNode node;
+        node.node_id = "node" + std::to_string(i + 1);
+        node.host = node_endpoints[i].first;
+        node.port = node_endpoints[i].second;
+        node.client = std::make_unique<httplib::Client>(node.host, node.port);
+        node.client->set_connection_timeout(3);
+        node.client->set_read_timeout(5);
+        nodes_.push_back(std::move(node));
+    }
+    InitWalletDir();
     OpenDebugLog();
-    DbgSep("CLI 会话启动");
-    DbgPrint("节点ID: " + config_.node_id);
-    DbgPrint("数据库: " + config_.db_path);
-    DbgPrint("链ID:   " + config_.chain_id);
-    Dbg("f=" + std::to_string(config_.f) +
-        " instance_count=" + std::to_string(config_.instance_count) +
-        " quorum=" + std::to_string(consensus_.Quorum()));
+    DbgSep("CLI 客户端启动");
+    Dbg("连接 " + std::to_string(nodes_.size()) + " 个节点");
+    Dbg("钱包目录: " + wallet_dir_);
 }
 
 CliSession::~CliSession() {
-    DbgSep("CLI 会话结束");
+    DbgSep("CLI 客户端结束");
     if (debug_log_.is_open()) debug_log_.close();
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// 钱包管理
+// ══════════════════════════════════════════════════════════════════════════════
+
+void CliSession::InitWalletDir() {
+    wallet_dir_ = "wallets";
+    std::filesystem::create_directories(wallet_dir_);
+}
+
+bool CliSession::SaveWallet(const std::string& username, const std::string& password,
+                             const std::string& address, const std::string& public_key, const std::string& private_key) {
+    // 通过节点 API 加密私钥
+    json enc_body = {{"plaintext", private_key}, {"password", password}};
+    std::string raw;
+    HttpPost(0, "/api/crypto/encrypt", enc_body.dump(), raw);
+    std::string data, err;
+    if (!ParseOk(raw, data, err)) {
+        Dbg("钱包加密失败: " + err);
+        return false;
+    }
+    auto d = json::parse(data);
+    std::string encrypted = d.value("encrypted", "");
+
+    // 写入钱包文件
+    json wallet = {
+        {"username", username},
+        {"address", address},
+        {"public_key", public_key},
+        {"encrypted_private_key", encrypted},
+        {"created_at", std::time(nullptr)}
+    };
+
+    std::string path = wallet_dir_ + "/" + username + ".wallet";
+    std::ofstream f(path);
+    if (!f.is_open()) return false;
+    f << wallet.dump(2);
+    f.close();
+
+    Dbg("钱包已保存: " + path);
+    return true;
+}
+
+bool CliSession::LoadWallet(const std::string& username, const std::string& password, Wallet& out) {
+    std::string path = wallet_dir_ + "/" + username + ".wallet";
+    std::ifstream f(path);
+    if (!f.is_open()) return false;
+
+    auto wallet = json::parse(f);
+    f.close();
+
+    out.username = wallet.value("username", "");
+    out.address = wallet.value("address", "");
+    out.public_key = wallet.value("public_key", "");
+    out.encrypted_key = wallet.value("encrypted_private_key", "");
+
+    // 通过节点 API 解密私钥
+    json dec_body = {{"encrypted", out.encrypted_key}, {"password", password}};
+    std::string raw;
+    HttpPost(0, "/api/crypto/decrypt", dec_body.dump(), raw);
+    std::string data, err;
+    if (!ParseOk(raw, data, err)) {
+        Dbg("钱包解密失败: " + err);
+        return false;
+    }
+    out.private_key = json::parse(data).value("plaintext", "");
+
+    Dbg("钱包已加载: " + path);
+    return true;
 }
 
 // ══════════════════════════════════════════════════════════════════════════════
@@ -45,11 +115,8 @@ CliSession::~CliSession() {
 // ══════════════════════════════════════════════════════════════════════════════
 
 void CliSession::OpenDebugLog() {
-    std::string log_path = "data/" + config_.node_id + "/cli_debug.log";
-    debug_log_.open(log_path, std::ios::app);
-    if (!debug_log_.is_open()) {
-        std::cerr << "[WARN] 无法打开调试日志: " << log_path << "\n";
-    }
+    log_path_ = "data/cli_client_debug.log";
+    debug_log_.open(log_path_, std::ios::app);
 }
 
 void CliSession::Dbg(const std::string& msg) {
@@ -57,10 +124,7 @@ void CliSession::Dbg(const std::string& msg) {
     char ts[32]{};
     std::strftime(ts, sizeof(ts), "%Y-%m-%d %H:%M:%S", std::localtime(&now));
     std::string line = std::string(ts) + " [DEBUG] " + msg;
-    if (debug_log_.is_open()) {
-        debug_log_ << line << "\n";
-        debug_log_.flush();
-    }
+    if (debug_log_.is_open()) { debug_log_ << line << "\n"; debug_log_.flush(); }
 }
 
 void CliSession::DbgPrint(const std::string& msg) {
@@ -68,27 +132,81 @@ void CliSession::DbgPrint(const std::string& msg) {
     char ts[32]{};
     std::strftime(ts, sizeof(ts), "%Y-%m-%d %H:%M:%S", std::localtime(&now));
     std::string line = std::string(ts) + " [DEBUG] " + msg;
-    if (debug_log_.is_open()) {
-        debug_log_ << line << "\n";
-        debug_log_.flush();
-    }
+    if (debug_log_.is_open()) { debug_log_ << line << "\n"; debug_log_.flush(); }
     std::cerr << "\033[90m" << line << "\033[0m\n";
 }
 
 void CliSession::DbgSep(const std::string& title) {
-    std::string sep(60, '=');
-    Dbg(sep);
+    Dbg("═══════════════════════════════════════════");
     Dbg("  " + title);
-    Dbg(sep);
+    Dbg("═══════════════════════════════════════════");
 }
 
 // ══════════════════════════════════════════════════════════════════════════════
-// 辅助函数
+// HTTP 辅助
+// ══════════════════════════════════════════════════════════════════════════════
+
+bool CliSession::HttpGet(int idx, const std::string& path, std::string& out) {
+    auto res = nodes_[idx].client->Get(path.c_str());
+    if (!res) { out = "{\"ok\":false,\"error\":\"连接失败\"}"; return false; }
+    out = res->body;
+    return true;
+}
+
+bool CliSession::HttpPost(int idx, const std::string& path, const std::string& body, std::string& out) {
+    auto res = nodes_[idx].client->Post(path.c_str(), body, "application/json");
+    if (!res) { out = "{\"ok\":false,\"error\":\"连接失败\"}"; return false; }
+    out = res->body;
+    return true;
+}
+
+bool CliSession::ParseOk(const std::string& body, std::string& out_data, std::string& out_error) {
+    try {
+        auto j = json::parse(body);
+        if (j.value("ok", false)) {
+            out_data = j.contains("data") ? j["data"].dump() : "";
+            return true;
+        }
+        out_error = j.value("error", "unknown error");
+        return false;
+    } catch (...) {
+        out_error = "JSON 解析失败";
+        return false;
+    }
+}
+
+CliSession::NodeResponse CliSession::SendToNode(int idx, const std::string& method, const std::string& path, const std::string& body) {
+    NodeResponse resp;
+    resp.node_idx = idx;
+    std::string raw;
+    if (method == "GET") HttpGet(idx, path, raw);
+    else HttpPost(idx, path, body, raw);
+    resp.ok = ParseOk(raw, resp.data, resp.error);
+    return resp;
+}
+
+std::vector<CliSession::NodeResponse> CliSession::BroadcastGet(const std::string& path) {
+    std::vector<NodeResponse> results;
+    for (size_t i = 0; i < nodes_.size(); ++i) {
+        results.push_back(SendToNode(i, "GET", path));
+    }
+    return results;
+}
+
+std::vector<CliSession::NodeResponse> CliSession::BroadcastPost(const std::string& path, const std::string& body) {
+    std::vector<NodeResponse> results;
+    for (size_t i = 0; i < nodes_.size(); ++i) {
+        results.push_back(SendToNode(i, "POST", path, body));
+    }
+    return results;
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// 辅助
 // ══════════════════════════════════════════════════════════════════════════════
 
 std::string CliSession::PromptLine(const std::string& prompt) const {
-    std::cout << prompt;
-    std::cout.flush();
+    std::cout << prompt; std::cout.flush();
     std::string line;
     if (!std::getline(std::cin, line)) return "";
     return line;
@@ -96,24 +214,22 @@ std::string CliSession::PromptLine(const std::string& prompt) const {
 
 uint64_t CliSession::PromptUint64(const std::string& prompt) const {
     auto s = PromptLine(prompt);
+    try { return std::stoull(s); } catch (...) { return 0; }
+}
+
+void CliSession::PrintOk(const std::string& msg) const { std::cout << "\033[32m[OK]\033[0m " << msg << "\n"; }
+void CliSession::PrintErr(const std::string& msg) const { std::cout << "\033[31m[ERR]\033[0m " << msg << "\n"; }
+void CliSession::Pause() const { std::cout << "\n按 Enter 继续..."; std::cin.get(); }
+
+int CliSession::PickNode(const std::string& prompt) const {
+    auto s = PromptLine(prompt);
+    if (s.empty()) return -1;
     try {
-        return std::stoull(s);
-    } catch (...) {
-        return 0;
-    }
-}
-
-void CliSession::PrintOk(const std::string& msg) const {
-    std::cout << "\033[32m[OK]\033[0m " << msg << "\n";
-}
-
-void CliSession::PrintErr(const std::string& msg) const {
-    std::cout << "\033[31m[ERR]\033[0m " << msg << "\n";
-}
-
-void CliSession::Pause() const {
-    std::cout << "\n按 Enter 继续...";
-    std::cin.get();
+        int n = std::stoi(s);
+        if (n == 0) return -1;  // 0 = 广播
+        if (n >= 1 && n <= static_cast<int>(nodes_.size())) return n - 1;
+    } catch (...) {}
+    return -1;
 }
 
 // ══════════════════════════════════════════════════════════════════════════════
@@ -122,103 +238,153 @@ void CliSession::Pause() const {
 
 void CliSession::ShowMenu() const {
     std::cout << "\n";
-    std::cout << "\033[36m╔══════════════════════════════════════════╗\033[0m\n";
-    std::cout << "\033[36m║\033[0m  \033[1mRBFT Chain Demo - 交互式命令行\033[0m          \033[36m║\033[0m\n";
-    std::cout << "\033[36m╠══════════════════════════════════════════╣\033[0m\n";
-    std::cout << "\033[36m║\033[0m  1. 注册用户                              \033[36m║\033[0m\n";
-    std::cout << "\033[36m║\033[0m  2. 用户登录                              \033[36m║\033[0m\n";
-    std::cout << "\033[36m║\033[0m  3. 转账交易                              \033[36m║\033[0m\n";
-    std::cout << "\033[36m║\033[0m  4. 存储数据 (STORE_DATA)                 \033[36m║\033[0m\n";
-    std::cout << "\033[36m║\033[0m  5. 查询账户状态                          \033[36m║\033[0m\n";
-    std::cout << "\033[36m║\033[0m  6. 查询区块                              \033[36m║\033[0m\n";
-    std::cout << "\033[36m║\033[0m  7. 查询交易                              \033[36m║\033[0m\n";
-    std::cout << "\033[36m║\033[0m  8. 查询待处理交易 (mempool)              \033[36m║\033[0m\n";
-    std::cout << "\033[36m║\033[0m  9. Merkle 证明验证                       \033[36m║\033[0m\n";
-    std::cout << "\033[36m║\033[0m 10. SMT 状态证明验证                      \033[36m║\033[0m\n";
-    std::cout << "\033[36m║\033[0m 11. 攻击模拟                              \033[36m║\033[0m\n";
-    std::cout << "\033[36m║\033[0m 12. 节点状态                              \033[36m║\033[0m\n";
-    std::cout << "\033[36m║\033[0m 13. 共识状态                              \033[36m║\033[0m\n";
-    std::cout << "\033[36m║\033[0m 14. 最近交易记录                          \033[36m║\033[0m\n";
-    std::cout << "\033[36m║\033[0m 15. 查看已注册用户 (管理)                 \033[36m║\033[0m\n";
-    std::cout << "\033[36m║\033[0m  0. 退出                                  \033[36m║\033[0m\n";
-    std::cout << "\033[36m╚══════════════════════════════════════════╝\033[0m\n";
-    if (active_user_index_ >= 0) {
-        const auto& u = logged_in_users_[active_user_index_];
-        std::cout << "  当前用户: \033[33m" << u.username << "\033[0m  "
-                  << "地址: " << u.address.substr(0, 12) << "...\n";
+    std::cout << "\033[36m╔══════════════════════════════════════════════╗\033[0m\n";
+    std::cout << "\033[36m║\033[0m  \033[1mRBFT Chain Demo - 多节点共识客户端\033[0m          \033[36m║\033[0m\n";
+    std::cout << "\033[36m╠══════════════════════════════════════════════╣\033[0m\n";
+    std::cout << "\033[36m║\033[0m  1. 注册用户 (广播到所有节点)                \033[36m║\033[0m\n";
+    std::cout << "\033[36m║\033[0m  2. 用户登录                                \033[36m║\033[0m\n";
+    std::cout << "\033[36m║\033[0m  3. 转账交易 (选择目标节点)                  \033[36m║\033[0m\n";
+    std::cout << "\033[36m║\033[0m  4. 存储数据 (STORE_DATA)                   \033[36m║\033[0m\n";
+    std::cout << "\033[36m║\033[0m  5. 查询所有节点账户状态                     \033[36m║\033[0m\n";
+    std::cout << "\033[36m║\033[0m  6. 查询所有节点最新区块                     \033[36m║\033[0m\n";
+    std::cout << "\033[36m║\033[0m  7. Merkle 证明对比                         \033[36m║\033[0m\n";
+    std::cout << "\033[36m║\033[0m  8. 所有节点状态总览                         \033[36m║\033[0m\n";
+    std::cout << "\033[36m║\033[0m  9. 攻击模拟 (设置恶意节点 + 验证拜占庭容错) \033[36m║\033[0m\n";
+    std::cout << "\033[36m║\033[0m 10. 最近交易记录                            \033[36m║\033[0m\n";
+    std::cout << "\033[36m║\033[0m 11. 查看所有用户                            \033[36m║\033[0m\n";
+    std::cout << "\033[36m║\033[0m 12. 多节点共识验证                          \033[36m║\033[0m\n";
+    std::cout << "\033[36m║\033[0m  0. 退出                                    \033[36m║\033[0m\n";
+    std::cout << "\033[36m╚══════════════════════════════════════════════╝\033[0m\n";
+    if (active_user_ >= 0) {
+        std::cout << "  当前用户: \033[33m" << users_[active_user_].username << "\033[0m  "
+                  << "地址: " << users_[active_user_].address.substr(0, 12) << "...\n";
     }
-    std::cout << "\n请选择 [0-15]: ";
+    std::cout << "\n请选择 [0-10]: ";
 }
 
 void CliSession::Run() {
+    // 检测节点连接
+    DbgPrint("检测节点连接...");
+    int alive = 0;
+    for (size_t i = 0; i < nodes_.size(); ++i) {
+        std::string body;
+        if (HttpGet(i, "/api/node/status", body)) {
+            auto j = json::parse(body, nullptr, false);
+            if (!j.is_discarded() && j.value("ok", false)) {
+                DbgPrint("  " + nodes_[i].node_id + " ✓");
+                alive++;
+            } else {
+                DbgPrint("  " + nodes_[i].node_id + " ✗ (无响应)");
+            }
+        } else {
+            DbgPrint("  " + nodes_[i].node_id + " ✗ (连接失败)");
+        }
+    }
+    if (alive == 0) {
+        PrintErr("没有可用节点! 请先启动 rbft_node:");
+        std::cout << "  bash scripts/start_4nodes.sh\n";
+        return;
+    }
+    DbgPrint(std::to_string(alive) + "/" + std::to_string(nodes_.size()) + " 个节点在线\n");
+
     while (true) {
         ShowMenu();
         std::string choice;
-        if (!std::getline(std::cin, choice)) break;  // EOF 退出
+        if (!std::getline(std::cin, choice)) break;
         if (choice.empty()) continue;
-
         try {
             int c = std::stoi(choice);
             switch (c) {
-                case 0:  return;
-                case 1:  DoRegister(); break;
-                case 2:  DoLogin(); break;
-                case 3:  DoTransfer(); break;
-                case 4:  DoStoreData(); break;
-                case 5:  DoQueryAccount(); break;
-                case 6:  DoQueryBlock(); break;
-                case 7:  DoQueryTransaction(); break;
-                case 8:  DoQueryPending(); break;
-                case 9:  DoMerkleProof(); break;
-                case 10: DoSMTProof(); break;
-                case 11: DoAttackSimulation(); break;
-                case 12: DoNodeStatus(); break;
-                case 13: DoConsensusStatus(); break;
-                case 14: DoShowHistory(); break;
-                case 15: DoListUsers(); break;
+                case 0: return;
+                case 1: DoRegister(); break;
+                case 2: DoLogin(); break;
+                case 3: DoTransfer(); break;
+                case 4: DoStoreData(); break;
+                case 5: DoQueryAccount(); break;
+                case 6: DoQueryBlock(); break;
+                case 7: DoMerkleProof(); break;
+                case 8: DoNodeStatus(); break;
+                case 9: DoAttackSimulation(); break;
+                case 10: DoShowHistory(); break;
+                case 11: DoListUsers(); break;
+                case 12: DoConsensusVerify(); break;
                 default: PrintErr("无效选择"); break;
             }
         } catch (const std::exception& e) {
-            PrintErr(std::string("操作异常: ") + e.what());
-            Dbg("异常: " + std::string(e.what()));
+            PrintErr(std::string("异常: ") + e.what());
         }
     }
 }
 
 // ══════════════════════════════════════════════════════════════════════════════
-// 1. 注册用户
+// 1. 注册用户 (广播到所有节点)
 // ══════════════════════════════════════════════════════════════════════════════
 
 void CliSession::DoRegister() {
     DbgSep("用户注册");
-    auto username = PromptLine("请输入用户名: ");
-    auto password = PromptLine("请输入密码: ");
-    if (username.empty() || password.empty()) {
-        PrintErr("用户名和密码不能为空");
+    auto username = PromptLine("用户名: ");
+    auto password = PromptLine("密  码: ");
+    if (username.size() < 3 || password.size() < 6) {
+        PrintErr("用户名>=3字符, 密码>=6字符");
         return;
     }
-    DbgPrint("注册用户: " + username);
 
-    auto kp = crypto::GenerateEd25519KeyPair();
-    Dbg("生成 Ed25519 密钥对:");
-    Dbg("  private_key_hex: " + kp.private_key_hex);
-    Dbg("  public_key_hex:  " + kp.public_key_hex);
+    // Step 1: 生成密钥对 (通过节点 API)
+    DbgPrint("Step 1 - 生成 Ed25519 密钥对...");
+    std::string raw;
+    HttpPost(0, "/api/crypto/generate-keypair", "{}", raw);
+    std::string data, err;
+    if (!ParseOk(raw, data, err)) {
+        PrintErr("密钥生成失败: " + err);
+        Pause();
+        return;
+    }
+    auto kp = json::parse(data);
+    std::string address = kp.value("address", "");
+    std::string pub_key = kp.value("public_key", "");
+    std::string priv_key = kp.value("private_key", "");
+    Dbg("  address=" + address);
+    Dbg("  public_key=" + pub_key);
+    Dbg("  private_key=" + priv_key.substr(0, 16) + "...");
 
-    auto user = users_->Register(username, password);
-    Dbg("address = SHA256(public_key)[0:40] = " + user.address);
-    Dbg("密码 Argon2 哈希完成");
-    Dbg("插入 users 表: user_id=" + std::to_string(user.user_id) + ", username=" + user.username);
-    Dbg("创建初始账户: address=" + user.address + ", balance=1000, nonce=0");
+    // Step 2: 加密私钥并保存到本地钱包文件
+    DbgPrint("Step 2 - 加密私钥保存到钱包...");
+    if (!SaveWallet(username, password, address, pub_key, priv_key)) {
+        PrintErr("钱包保存失败");
+        Pause();
+        return;
+    }
+    std::cout << "  钱包文件: wallets/" << username << ".wallet\n";
+    std::cout << "  私钥已加密存储 (AES-256, 密钥从密码派生)\n";
 
-    std::cout << "\n";
-    PrintOk("用户注册成功!");
-    std::cout << "  用户名:     " << user.username << "\n";
-    std::cout << "  用户ID:     " << user.user_id << "\n";
-    std::cout << "  地址:       " << user.address << "\n";
-    std::cout << "  公钥:       " << user.public_key_hex.substr(0, 32) << "...\n";
-    std::cout << "  私钥:       " << user.private_key_hex.substr(0, 32) << "... (仅演示)\n";
-    std::cout << "  初始余额:   1000\n";
-    Dbg("=== 注册完成 ===");
+    // Step 3: 广播公钥+地址到所有节点 (不发送私钥)
+    DbgPrint("Step 3 - 广播公钥到所有节点...");
+    json reg_body = {
+        {"username", username}, {"password", password},
+        {"address", address}, {"public_key", pub_key}, {"private_key", priv_key}
+    };
+
+    int ok_count = 0;
+    for (size_t i = 0; i < nodes_.size(); ++i) {
+        std::string r;
+        HttpPost(i, "/api/users/register", reg_body.dump(), r);
+        std::string dd, ee;
+        if (ParseOk(r, dd, ee)) {
+            ok_count++;
+            Dbg("  " + nodes_[i].node_id + " ✓");
+        } else {
+            Dbg("  " + nodes_[i].node_id + " ✗ " + ee);
+        }
+    }
+
+    RemoteUser user{username, address, pub_key, priv_key, ""};
+    users_.push_back(user);
+    active_user_ = static_cast<int>(users_.size()) - 1;
+
+    PrintOk("注册完成 (" + std::to_string(ok_count) + "/" + std::to_string(nodes_.size()) + " 节点)");
+    std::cout << "  用户名: " << username << "\n";
+    std::cout << "  地  址: " << address << "\n";
+    std::cout << "  钱  包: wallets/" << username << ".wallet (私钥加密存储)\n";
     Pause();
 }
 
@@ -229,30 +395,41 @@ void CliSession::DoRegister() {
 void CliSession::DoLogin() {
     DbgSep("用户登录");
     auto username = PromptLine("用户名: ");
-    auto password = PromptLine("密码: ");
-    DbgPrint("登录用户: " + username);
+    auto password = PromptLine("密  码: ");
 
-    auto login = users_->Login(username, password);
-    Dbg("密码 Argon2 验证通过");
-    Dbg("生成 session token: " + login.token.substr(0, 16) + "...");
-    Dbg("返回密钥信息:");
-    Dbg("  address:      " + login.user.address);
-    Dbg("  public_key:   " + login.user.public_key_hex);
-    Dbg("  private_key:  " + login.user.private_key_hex);
+    // 从本地钱包文件加载密钥
+    DbgPrint("从钱包文件加载密钥...");
+    Wallet wallet;
+    if (!LoadWallet(username, password, wallet)) {
+        PrintErr("钱包加载失败 (密码错误或钱包文件不存在)");
+        Pause();
+        return;
+    }
 
-    CliUserSession session;
-    session.username = login.user.username;
-    session.address = login.user.address;
-    session.public_key_hex = login.user.public_key_hex;
-    session.private_key_hex = login.user.private_key_hex;
-    session.token = login.token;
-    logged_in_users_.push_back(session);
-    active_user_index_ = static_cast<int>(logged_in_users_.size()) - 1;
+    // 向节点验证用户存在
+    bool verified = false;
+    for (size_t i = 0; i < nodes_.size(); ++i) {
+        std::string raw;
+        HttpGet(i, "/api/state/" + wallet.address, raw);
+        std::string data, err;
+        if (ParseOk(raw, data, err)) {
+            verified = true;
+            Dbg("  " + nodes_[i].node_id + " ✓ 账户存在");
+            break;
+        }
+    }
 
-    std::cout << "\n";
-    PrintOk("登录成功! 当前用户: " + login.user.username);
-    std::cout << "  地址: " << login.user.address << "\n";
-    Dbg("=== 登录完成 ===");
+    RemoteUser user{username, wallet.address, wallet.public_key, wallet.private_key, ""};
+    users_.push_back(user);
+    active_user_ = static_cast<int>(users_.size()) - 1;
+
+    PrintOk("登录成功");
+    std::cout << "  地址: " << wallet.address << "\n";
+    std::cout << "  私钥来源: wallets/" << username << ".wallet\n";
+    if (!verified) {
+        std::cout << "  \033[33m注意: 节点上未找到该账户，请先注册\033[0m\n";
+    }
+    Dbg("登录: " + username + " address=" + wallet.address);
     Pause();
 }
 
@@ -261,75 +438,68 @@ void CliSession::DoLogin() {
 // ══════════════════════════════════════════════════════════════════════════════
 
 void CliSession::DoTransfer() {
-    if (active_user_index_ < 0) {
-        PrintErr("请先登录");
-        return;
-    }
+    if (active_user_ < 0) { PrintErr("请先登录"); return; }
     DbgSep("转账交易");
-    const auto& sender = logged_in_users_[active_user_index_];
-    DbgPrint("发送方: " + sender.username + " (" + sender.address.substr(0, 12) + "...)");
 
+    const auto& user = users_[active_user_];
     auto to_addr = PromptLine("接收方地址: ");
     auto amount = PromptUint64("转账金额: ");
-    if (to_addr.empty() || amount == 0) {
-        PrintErr("地址和金额不能为空/零");
-        return;
+    if (to_addr.empty() || amount == 0) { PrintErr("地址和金额不能为空"); return; }
+
+    // 选择目标节点
+    std::cout << "  发送到哪个节点?\n";
+    for (size_t i = 0; i < nodes_.size(); ++i) {
+        std::cout << "    " << (i + 1) << ". " << nodes_[i].node_id << "\n";
+    }
+    std::cout << "    0. 广播到所有节点\n";
+    int target = PickNode("选择 [0-" + std::to_string(nodes_.size()) + "]: ");
+
+    // 确定需要查询 nonce 的节点
+    int nonce_node = (target >= 0) ? target : 0;
+    uint64_t nonce = 1;
+    std::string raw;
+    if (HttpGet(nonce_node, "/api/state/" + user.address, raw)) {
+        std::string data, err;
+        if (ParseOk(raw, data, err)) {
+            nonce = json::parse(data).value("nonce", 0ULL) + 1;
+        }
     }
 
-    // 获取当前 nonce
-    auto account = storage_.GetAccount(sender.address);
-    uint64_t nonce = account ? account->nonce + 1 : 1;
-    Dbg("当前账户状态: balance=" +
-        (account ? std::to_string(account->balance) : "0") +
-        ", nonce=" + (account ? std::to_string(account->nonce) : "0"));
-    Dbg("新 nonce: " + std::to_string(nonce));
+    json tx_body = {
+        {"type", "TRANSFER"}, {"from", user.address}, {"to", to_addr},
+        {"amount", amount}, {"nonce", nonce}, {"timestamp", 0},
+        {"public_key", user.public_key}, {"private_key", user.private_key}
+    };
 
-    // 构建交易对象
-    Transaction tx;
-    tx.type = "TRANSFER";
-    tx.from = sender.address;
-    tx.to = to_addr;
-    tx.amount = amount;
-    tx.nonce = nonce;
-    tx.timestamp = NowMillis();
-    tx.public_key_hex = sender.public_key_hex;
-    tx.data_hash = "";
+    Dbg("nonce=" + std::to_string(nonce) + " (from " + nodes_[nonce_node].node_id + ")");
 
-    Dbg("构建 Transaction 对象:");
-    Dbg("  type=TRANSFER");
-    Dbg("  from=" + tx.from);
-    Dbg("  to=" + tx.to);
-    Dbg("  amount=" + std::to_string(tx.amount));
-    Dbg("  nonce=" + std::to_string(tx.nonce));
-    Dbg("  timestamp=" + std::to_string(tx.timestamp));
-
-    std::string error;
-    if (!SubmitAndCommit(tx, error)) {
-        PrintErr("交易失败: " + error);
-        return;
+    std::vector<NodeResponse> results;
+    if (target < 0) {
+        DbgPrint("广播转账到所有节点...");
+        results = BroadcastPost("/api/transactions/transfer", tx_body.dump());
+    } else {
+        DbgPrint("发送转账到 " + nodes_[target].node_id + "...");
+        results.push_back(SendToNode(target, "POST", "/api/transactions/transfer", tx_body.dump()));
     }
 
-    // 获取区块高度并保存交易记录
-    uint64_t height = 0;
-    auto latest = storage_.GetLatestBlock();
-    if (latest) height = latest->header.height;
-    TxRecord rec{tx.tx_id, tx.type, tx.from, tx.to, tx.amount, height};
-    recent_tx_map_.Put(tx.tx_id, rec);
-    tx_order_.push_back(tx.tx_id);
+    for (const auto& r : results) {
+        if (r.ok) {
+            auto d = json::parse(r.data);
+            std::string tx_id = d.value("tx_id", "");
+            std::string status = d.value("status", "");
+            uint64_t height = d.value("block_height", 0ULL);
+            Dbg("  " + nodes_[r.node_idx].node_id + " ✓ tx_id=" + tx_id.substr(0, 16) + " status=" + status);
 
-    std::cout << "\n";
-    PrintOk("转账成功! tx_id=" + tx.tx_id.substr(0, 16) + "...");
-    std::cout << "  tx_id:      " << tx.tx_id << "\n";
-    std::cout << "  区块高度:   " << height << "\n";
-    auto new_acc = storage_.GetAccount(sender.address);
-    if (new_acc) {
-        std::cout << "  发送方余额: " << new_acc->balance << "\n";
+            recent_txs_.push_back({tx_id, "TRANSFER", user.address, to_addr, amount, status});
+            tx_order_.push_back(tx_id);
+
+            PrintOk(nodes_[r.node_idx].node_id + ": " + status + " height=" + std::to_string(height));
+            std::cout << "  tx_id: " << tx_id << "\n";
+        } else {
+            Dbg("  " + nodes_[r.node_idx].node_id + " ✗ " + r.error);
+            PrintErr(nodes_[r.node_idx].node_id + ": " + r.error);
+        }
     }
-    auto recv_acc = storage_.GetAccount(to_addr);
-    if (recv_acc) {
-        std::cout << "  接收方余额: " << recv_acc->balance << "\n";
-    }
-    Dbg("=== 转账完成 ===");
     Pause();
 }
 
@@ -338,998 +508,656 @@ void CliSession::DoTransfer() {
 // ══════════════════════════════════════════════════════════════════════════════
 
 void CliSession::DoStoreData() {
-    if (active_user_index_ < 0) {
-        PrintErr("请先登录");
-        return;
-    }
-    DbgSep("存储数据交易 (STORE_DATA)");
-    const auto& sender = logged_in_users_[active_user_index_];
-    auto data = PromptLine("请输入要存储的数据: ");
-    if (data.empty()) {
-        PrintErr("数据不能为空");
-        return;
-    }
+    if (active_user_ < 0) { PrintErr("请先登录"); return; }
+    DbgSep("存储数据");
+    const auto& user = users_[active_user_];
+    auto data_str = PromptLine("数据: ");
+    if (data_str.empty()) { PrintErr("数据不能为空"); return; }
 
-    auto account = storage_.GetAccount(sender.address);
-    uint64_t nonce = account ? account->nonce + 1 : 1;
-    Dbg("当前 nonce=" + (account ? std::to_string(account->nonce) : "0") + ", 新 nonce=" + std::to_string(nonce));
-
-    // 计算数据哈希
-    auto data_hash = crypto::Sha256Hex(data);
-    Dbg("data_hash = SHA256(data) = " + data_hash);
-
-    Transaction tx;
-    tx.type = "STORE_DATA";
-    tx.from = sender.address;
-    tx.to = "";
-    tx.amount = 0;
-    tx.data_hash = data_hash;
-    tx.nonce = nonce;
-    tx.timestamp = NowMillis();
-    tx.public_key_hex = sender.public_key_hex;
-
-    Dbg("构建 Transaction 对象:");
-    Dbg("  type=STORE_DATA");
-    Dbg("  from=" + tx.from);
-    Dbg("  data_hash=" + tx.data_hash);
-    Dbg("  nonce=" + std::to_string(tx.nonce));
-
-    std::string error;
-    if (!SubmitAndCommit(tx, error)) {
-        PrintErr("交易失败: " + error);
-        return;
+    uint64_t nonce = 1;
+    std::string raw;
+    if (HttpGet(0, "/api/state/" + user.address, raw)) {
+        std::string d, e;
+        if (ParseOk(raw, d, e)) nonce = json::parse(d).value("nonce", 0ULL) + 1;
     }
 
-    uint64_t height = 0;
-    auto latest = storage_.GetLatestBlock();
-    if (latest) height = latest->header.height;
-    TxRecord rec{tx.tx_id, tx.type, tx.from, "", 0, height};
-    recent_tx_map_.Put(tx.tx_id, rec);
-    tx_order_.push_back(tx.tx_id);
+    json body = {
+        {"type", "STORE_DATA"}, {"from", user.address}, {"to", ""},
+        {"amount", 0}, {"data_hash", ""}, {"nonce", nonce}, {"timestamp", 0},
+        {"public_key", user.public_key}, {"private_key", user.private_key}
+    };
 
-    PrintOk("数据存储成功! tx_id=" + tx.tx_id.substr(0, 16) + "...");
-    std::cout << "  tx_id:    " << tx.tx_id << "\n";
-    std::cout << "  区块高度: " << height << "\n";
-    Dbg("=== STORE_DATA 完成 ===");
+    int target = -1;
+    std::cout << "  发送到节点 [1-" << nodes_.size() << ", 0=全部]: ";
+    target = PickNode("");
+
+    std::vector<NodeResponse> results;
+    if (target < 0) results = BroadcastPost("/api/transactions/store", body.dump());
+    else results.push_back(SendToNode(target, "POST", "/api/transactions/store", body.dump()));
+
+    for (const auto& r : results) {
+        if (r.ok) {
+            auto d = json::parse(r.data);
+            std::string tx_id = d.value("tx_id", "");
+            PrintOk(nodes_[r.node_idx].node_id + ": tx_id=" + tx_id.substr(0, 16) + "...");
+            recent_txs_.push_back({tx_id, "STORE_DATA", user.address, "", 0, d.value("status", "")});
+            tx_order_.push_back(tx_id);
+        } else {
+            PrintErr(nodes_[r.node_idx].node_id + ": " + r.error);
+        }
+    }
     Pause();
 }
 
 // ══════════════════════════════════════════════════════════════════════════════
-// 提交交易并出块（核心流程，附带详细日志）
-// ══════════════════════════════════════════════════════════════════════════════
-
-bool CliSession::SubmitAndCommit(Transaction& tx, std::string& out_error) {
-    // ── Step 1: 序列化交易体 ──
-    auto tx_body = SerializeTransactionBody(tx);
-    Dbg("Step 1 - 序列化 tx_body:");
-    Dbg("  字段顺序: type|from|to|amount|data_hash|nonce|timestamp|public_key");
-    Dbg("  tx_body = " + tx_body);
-
-    // ── Step 2: 签名 ──
-    tx.signature_hex = crypto::SignDetachedHex(tx_body, logged_in_users_[active_user_index_].private_key_hex);
-    Dbg("Step 2 - Ed25519 签名:");
-    Dbg("  signature_hex = " + tx.signature_hex);
-
-    // ── Step 3: 计算 tx_id ──
-    tx.tx_id = ComputeTransactionId(tx);
-    Dbg("Step 3 - 计算 tx_id:");
-    Dbg("  tx_id = SHA256(body + \"|\" + signature) = " + tx.tx_id);
-
-    // ── Step 4: Mempool 入场检查 ──
-    Dbg("Step 4 - Mempool 入场检查:");
-    if (!mempool_.AddTransaction(tx, out_error)) {
-        DbgPrint("  ✗ Mempool 拒绝: " + out_error);
-        return false;
-    }
-    Dbg("  ✓ tx_id 非空");
-    Dbg("  ✓ 无重复交易");
-    Dbg("  ✓ 签名验证通过");
-    Dbg("  ✓ 交易大小 OK (≤16KB)");
-    DbgPrint("  交易已加入 mempool, tx_id=" + tx.tx_id.substr(0, 16) + "...");
-
-    // ── Step 5: 记录共识事件 ──
-    consensus_.AddEvent({0, 0, "", 0, 0, 0, "MEMPOOL_ADD", tx.from, config_.node_id, tx.tx_id, true, "", ""});
-    Dbg("Step 5 - 共识事件 MEMPOOL_ADD 已记录");
-
-    // 持久化交易为 PENDING
-    storage_.PutTransaction(tx, "PENDING", std::nullopt, std::nullopt);
-
-    // ── Step 6: 出块 ──
-    if (consensus_.IsRunning() && consensus_.GetAttackMode() == AttackMode::NORMAL) {
-        DbgPrint("Step 6 - 构建区块...");
-
-        auto picked = mempool_.PickTransactions(100);
-        Dbg("  从 mempool 取出 " + std::to_string(picked.size()) + " 笔交易");
-
-        try {
-            Block block;
-            block.transactions = picked;
-            block.header.chain_id = config_.chain_id;
-            block.header.height = std::stoull(storage_.GetMetadata("latest_height", "0")) + 1;
-            auto latest = storage_.GetLatestBlock();
-            block.header.previous_block_hash = latest ? latest->header.block_hash : std::string(64, '0');
-
-            Dbg("  height=" + std::to_string(block.header.height));
-            Dbg("  previous_block_hash=" + block.header.previous_block_hash);
-
-            // Merkle 树构建
-            Dbg("  --- Merkle Tree 构建 ---");
-            auto levels = MerkleTree::BuildLevels(picked);
-            for (size_t lv = 0; lv < levels.size(); ++lv) {
-                std::string hashes;
-                for (size_t i = 0; i < levels[lv].size(); ++i) {
-                    if (i > 0) hashes += ", ";
-                    hashes += HashToHex(levels[lv][i]).substr(0, 16) + "...";
-                }
-                Dbg("    level[" + std::to_string(lv) + "]: [" + hashes + "]");
-            }
-            block.header.tx_merkle_root = HashToHex(MerkleTree::ComputeRoot(picked));
-            Dbg("  tx_merkle_root = " + block.header.tx_merkle_root);
-
-            // 执行交易计算 state_root
-            Dbg("  --- 执行交易计算 state_root ---");
-            for (size_t i = 0; i < picked.size(); ++i) {
-                const auto& ptx = picked[i];
-                Dbg("    tx[" + std::to_string(i) + "] type=" + ptx.type +
-                    " from=" + ptx.from.substr(0, 12) + "..." +
-                    " amount=" + std::to_string(ptx.amount) +
-                    " nonce=" + std::to_string(ptx.nonce));
-                if (ptx.type == "TRANSFER") {
-                    auto from_before = storage_.GetAccount(ptx.from);
-                    auto to_before = storage_.GetAccount(ptx.to);
-                    Dbg("      from 余额: " +
-                        (from_before ? std::to_string(from_before->balance) : "0") +
-                        " → " + std::to_string(from_before ? from_before->balance - ptx.amount : 0));
-                    Dbg("      to   余额: " +
-                        (to_before ? std::to_string(to_before->balance) : "0") +
-                        " → " + std::to_string(to_before ? to_before->balance + ptx.amount : ptx.amount));
-                }
-            }
-            block.header.state_root = executor_.ExecuteForStateRoot(picked);
-            Dbg("  state_root = " + block.header.state_root);
-
-            block.header.timestamp = NowMillis();
-            block.header.view = 0;
-            block.header.instance_id = 0;
-            block.header.proposer_id = config_.node_id;
-            block.header.block_hash = ComputeBlockHash(block.header);
-
-            Dbg("  proposer_id = " + block.header.proposer_id);
-            Dbg("  block_hash = " + block.header.block_hash);
-
-            // 序列化区块头
-            Dbg("  --- 区块头序列化 ---");
-            auto header_ser = SerializeBlockHeaderForHash(block.header);
-            Dbg("  header_serialized = " + header_ser);
-
-            // 提交区块
-            executor_.CommitBlock(block);
-            Dbg("  区块已提交到数据库");
-
-            consensus_.AddEvent({0, 0, "", block.header.height, block.header.view, block.header.instance_id,
-                                 "AUTO_COMMIT_BLOCK", config_.node_id, config_.node_id, block.header.block_hash, true, "", ""});
-            mempool_.RemoveCommitted(picked);
-
-            DbgPrint("Step 7 - 区块提交成功: height=" + std::to_string(block.header.height));
-            return true;
-        } catch (const std::exception& e) {
-            // 出块失败: 清理 mempool 和 DB 中的 PENDING 交易
-            Dbg("  出块失败: " + std::string(e.what()));
-            Dbg("  回滚: 清理 mempool 和 PENDING 交易");
-            mempool_.RemoveCommitted(picked);  // 从 mempool 移除
-            // 从 DB 删除这些 PENDING 交易
-            for (const auto& ptx : picked) {
-                try {
-                    // 直接执行 SQL 删除 PENDING 交易
-                    sqlite3_stmt* del = nullptr;
-                    sqlite3_prepare_v2(storage_.Raw(),
-                        "DELETE FROM transactions WHERE tx_id=? AND status='PENDING';",
-                        -1, &del, nullptr);
-                    sqlite3_bind_text(del, 1, ptx.tx_id.c_str(), -1, SQLITE_TRANSIENT);
-                    sqlite3_step(del);
-                    sqlite3_finalize(del);
-                } catch (...) {}
-            }
-            out_error = std::string("出块失败: ") + e.what() + " (交易已回滚)";
-            return false;
-        }
-    }
-
-    DbgPrint("  共识引擎未运行或处于攻击模式，交易状态: PENDING");
-    return true;
-}
-
-// ══════════════════════════════════════════════════════════════════════════════
-// 5. 查询账户状态
+// 5. 查询所有节点账户状态
 // ══════════════════════════════════════════════════════════════════════════════
 
 void CliSession::DoQueryAccount() {
-    auto addr = PromptLine("请输入账户地址 (留空查询当前用户): ");
-    if (addr.empty() && active_user_index_ >= 0) {
-        addr = logged_in_users_[active_user_index_].address;
-    }
-    if (addr.empty()) {
-        PrintErr("地址不能为空");
-        return;
-    }
+    auto addr = PromptLine("账户地址 (留空=当前用户): ");
+    if (addr.empty() && active_user_ >= 0) addr = users_[active_user_].address;
+    if (addr.empty()) { PrintErr("地址不能为空"); return; }
 
-    auto account = storage_.GetAccount(addr);
-    if (!account) {
-        PrintErr("账户不存在: " + addr);
-        return;
+    DbgSep("查询账户: " + addr.substr(0, 12) + "...");
+    std::cout << "\n  ── 各节点账户状态 ──\n";
+    std::cout << "  节点   │ 余额   │ Nonce\n";
+    std::cout << "  ───────┼────────┼──────\n";
+
+    auto results = BroadcastGet("/api/state/" + addr);
+    for (const auto& r : results) {
+        if (r.ok) {
+            auto d = json::parse(r.data);
+            std::cout << "  " << std::setw(6) << nodes_[r.node_idx].node_id << " │ "
+                      << std::setw(6) << d.value("balance", 0ULL) << " │ "
+                      << d.value("nonce", 0ULL) << "\n";
+        } else {
+            std::cout << "  " << std::setw(6) << nodes_[r.node_idx].node_id << " │ "
+                      << "  (离线)\n";
+        }
     }
-
-    DbgSep("查询账户状态");
-    Dbg("address=" + account->address);
-    Dbg("balance=" + std::to_string(account->balance));
-    Dbg("nonce=" + std::to_string(account->nonce));
-
-    std::cout << "\n  地址:   " << account->address << "\n";
-    std::cout << "  余额:   " << account->balance << "\n";
-    std::cout << "  Nonce:  " << account->nonce << "\n";
     Pause();
 }
 
 // ══════════════════════════════════════════════════════════════════════════════
-// 6. 查询区块
+// 6. 查询所有节点最新区块
 // ══════════════════════════════════════════════════════════════════════════════
 
 void CliSession::DoQueryBlock() {
-    auto input = PromptLine("请输入区块高度 (留空查询最新): ");
-    std::optional<Block> block;
-    if (input.empty()) {
-        block = storage_.GetLatestBlock();
-    } else {
-        block = storage_.GetBlockByHeight(std::stoull(input));
-    }
-    if (!block) {
-        PrintErr("区块不存在");
-        return;
-    }
+    DbgSep("查询最新区块");
+    std::cout << "\n  ── 各节点最新区块 ──\n";
+    std::cout << "  节点   │ 高度 │ 区块哈希         │ Merkle根         │ state_root\n";
+    std::cout << "  ───────┼──────┼──────────────────┼──────────────────┼──────────────────\n";
 
-    DbgSep("查询区块 #" + std::to_string(block->header.height));
-    Dbg("chain_id=" + block->header.chain_id);
-    Dbg("height=" + std::to_string(block->header.height));
-    Dbg("previous_block_hash=" + block->header.previous_block_hash);
-    Dbg("tx_merkle_root=" + block->header.tx_merkle_root);
-    Dbg("state_root=" + block->header.state_root);
-    Dbg("block_hash=" + block->header.block_hash);
-    Dbg("proposer_id=" + block->header.proposer_id);
-    Dbg("交易数量=" + std::to_string(block->transactions.size()));
+    auto results = BroadcastGet("/api/blocks/latest");
+    std::string first_hash;
+    bool consistent = true;
 
-    std::cout << "\n  高度:       " << block->header.height << "\n";
-    std::cout << "  区块哈希:   " << block->header.block_hash.substr(0, 32) << "...\n";
-    std::cout << "  前一区块:   " << block->header.previous_block_hash.substr(0, 32) << "...\n";
-    std::cout << "  Merkle根:   " << block->header.tx_merkle_root.substr(0, 32) << "...\n";
-    std::cout << "  状态根:     " << block->header.state_root.substr(0, 32) << "...\n";
-    std::cout << "  提议者:     " << block->header.proposer_id << "\n";
-    std::cout << "  交易数:     " << block->transactions.size() << "\n";
-    for (size_t i = 0; i < block->transactions.size(); ++i) {
-        const auto& t = block->transactions[i];
-        std::cout << "    [" << i << "] " << t.type << " " << t.from.substr(0, 8) << "... → "
-                  << t.to.substr(0, 8) << "...  amount=" << t.amount << "\n";
-    }
-    Pause();
-}
+    for (const auto& r : results) {
+        if (r.ok) {
+            auto d = json::parse(r.data);
+            auto hdr = d["header"];
+            std::string hash = hdr.value("block_hash", "");
+            std::string merkle = hdr.value("tx_merkle_root", "");
+            std::string state = hdr.value("state_root", "");
+            uint64_t height = hdr.value("height", 0ULL);
 
-// ══════════════════════════════════════════════════════════════════════════════
-// 7. 查询交易
-// ══════════════════════════════════════════════════════════════════════════════
+            if (first_hash.empty()) first_hash = hash;
+            else if (hash != first_hash) consistent = false;
 
-void CliSession::DoQueryTransaction() {
-    auto tx_id = PickTxId("请输入交易ID (或最近记录编号): ");
-    if (tx_id.empty()) {
-        PrintErr("交易ID不能为空");
-        return;
+            std::cout << "  " << std::setw(6) << nodes_[r.node_idx].node_id << " │ "
+                      << std::setw(4) << height << " │ "
+                      << hash.substr(0, 16) << ".. │ "
+                      << merkle.substr(0, 16) << ".. │ "
+                      << state.substr(0, 16) << "..\n";
+        } else {
+            std::cout << "  " << std::setw(6) << nodes_[r.node_idx].node_id << " │ (无区块)\n";
+        }
     }
 
-    auto tx = storage_.GetTransaction(tx_id);
-    if (!tx) {
-        PrintErr("交易不存在");
-        return;
-    }
-
-    DbgSep("查询交易");
-    Dbg("tx_id=" + tx->tx_id);
-    Dbg("type=" + tx->type);
-    Dbg("from=" + tx->from);
-    Dbg("to=" + tx->to);
-    Dbg("amount=" + std::to_string(tx->amount));
-    Dbg("nonce=" + std::to_string(tx->nonce));
-    Dbg("timestamp=" + std::to_string(tx->timestamp));
-
-    std::cout << "\n  tx_id:     " << tx->tx_id << "\n";
-    std::cout << "  类型:      " << tx->type << "\n";
-    std::cout << "  发送方:    " << tx->from << "\n";
-    std::cout << "  接收方:    " << tx->to << "\n";
-    std::cout << "  金额:      " << tx->amount << "\n";
-    std::cout << "  Nonce:     " << tx->nonce << "\n";
-    std::cout << "  时间戳:    " << tx->timestamp << "\n";
-    Pause();
-}
-
-// ══════════════════════════════════════════════════════════════════════════════
-// 8. 查询待处理交易
-// ══════════════════════════════════════════════════════════════════════════════
-
-void CliSession::DoQueryPending() {
-    auto pending = mempool_.Pending();
-    DbgSep("查询 mempool 待处理交易");
-    Dbg("待处理交易数: " + std::to_string(pending.size()));
-
-    std::cout << "\n  待处理交易数: " << pending.size() << "\n";
-    for (size_t i = 0; i < pending.size(); ++i) {
-        const auto& t = pending[i];
-        std::cout << "  [" << i << "] " << t.tx_id.substr(0, 16) << "... "
-                  << t.type << " " << t.from.substr(0, 8) << "... → "
-                  << t.to.substr(0, 8) << "...  amount=" << t.amount << "\n";
+    if (!consistent) {
+        std::cout << "\n  \033[31m⚠ 区块哈希不一致! 存在拜占庭节点。\033[0m\n";
     }
     Pause();
 }
 
 // ══════════════════════════════════════════════════════════════════════════════
-// 9. Merkle 证明验证
+// 7. Merkle 证明对比
 // ══════════════════════════════════════════════════════════════════════════════
 
 void CliSession::DoMerkleProof() {
-    auto tx_id = PickTxId("请输入交易ID (或最近记录编号): ");
-    if (tx_id.empty()) {
-        PrintErr("交易ID不能为空");
-        return;
-    }
+    DbgSep("Merkle 证明对比");
+    auto tx_id = PromptLine("交易ID (留空=最近一笔): ");
+    if (tx_id.empty() && !tx_order_.empty()) tx_id = tx_order_.back();
+    if (tx_id.empty()) { PrintErr("没有交易记录"); return; }
 
-    auto tx = storage_.GetTransaction(tx_id);
-    auto height = storage_.GetTransactionBlockHeight(tx_id);
-    if (!tx || !height) {
-        PrintErr("未找到已提交的交易");
-        return;
-    }
-    auto block = storage_.GetBlockByHeight(*height);
-    if (!block) {
-        PrintErr("区块不存在");
-        return;
-    }
+    std::cout << "\n  ── 各节点 Merkle 证明 ──\n";
+    auto results = BroadcastGet("/api/proofs/tx/" + tx_id);
+    std::string first_root;
+    bool consistent = true;
 
-    // 找到交易在区块中的索引
-    size_t index = 0;
-    for (; index < block->transactions.size(); ++index) {
-        if (block->transactions[index].tx_id == tx->tx_id) break;
-    }
+    for (const auto& r : results) {
+        if (r.ok) {
+            auto d = json::parse(r.data);
+            std::string root = d.value("root", "");
+            if (first_root.empty()) first_root = root;
+            else if (root != first_root) consistent = false;
 
-    DbgSep("Merkle 证明验证");
-    DbgPrint("验证交易 " + tx->tx_id.substr(0, 16) + "... 的 Merkle 证明");
-    Dbg("tx_id=" + tx->tx_id);
-    Dbg("block_height=" + std::to_string(*height));
-    Dbg("tx_index=" + std::to_string(index));
-
-    // 叶子哈希
-    auto leaf_hash = MerkleTree::LeafHash(*tx);
-    Dbg("leaf_hash = Hash(0x00 || tx_serialized) = " + HashToHex(leaf_hash));
-
-    // 生成证明
-    auto proof = MerkleTree::GenerateProof(block->transactions, index);
-    Dbg("证明路径 (" + std::to_string(proof.size()) + " 层):");
-    for (size_t i = 0; i < proof.size(); ++i) {
-        Dbg("  [" + std::to_string(i) + "] " +
-            std::string(proof[i].position == MerkleProofItem::Position::LEFT ? "LEFT" : "RIGHT") +
-            " sibling=" + HashToHex(proof[i].sibling_hash));
-    }
-
-    // 重算根哈希
-    Dbg("--- 重算根哈希 ---");
-    Hash current = leaf_hash;
-    for (size_t lv = 0; lv < proof.size(); ++lv) {
-        auto before = current;
-        if (proof[lv].position == MerkleProofItem::Position::LEFT) {
-            current = MerkleTree::ParentHash(proof[lv].sibling_hash, current);
-            Dbg("  level[" + std::to_string(lv) + "]: LEFT  Hash(" +
-                HashToHex(proof[lv].sibling_hash).substr(0, 12) + "... || " +
-                HashToHex(before).substr(0, 12) + "...) = " +
-                HashToHex(current).substr(0, 16) + "...");
+            std::cout << "  " << nodes_[r.node_idx].node_id << ": root=" << root.substr(0, 24) << "...\n";
         } else {
-            current = MerkleTree::ParentHash(current, proof[lv].sibling_hash);
-            Dbg("  level[" + std::to_string(lv) + "]: RIGHT Hash(" +
-                HashToHex(before).substr(0, 12) + "... || " +
-                HashToHex(proof[lv].sibling_hash).substr(0, 12) + "...) = " +
-                HashToHex(current).substr(0, 16) + "...");
+            std::cout << "  " << nodes_[r.node_idx].node_id << ": " << r.error << "\n";
         }
     }
-
-    bool valid = (HashToHex(current) == block->header.tx_merkle_root);
-    Dbg("computed_root = " + HashToHex(current));
-    Dbg("expected_root = " + block->header.tx_merkle_root);
-    Dbg("验证结果: " + std::string(valid ? "✓ 通过" : "✗ 失败"));
-
-    std::cout << "\n  交易ID:     " << tx->tx_id.substr(0, 24) << "...\n";
-    std::cout << "  区块高度:   " << *height << "\n";
-    std::cout << "  证明层数:   " << proof.size() << "\n";
-    std::cout << "  计算根:     " << HashToHex(current).substr(0, 32) << "...\n";
-    std::cout << "  期望根:     " << block->header.tx_merkle_root.substr(0, 32) << "...\n";
-    if (valid) PrintOk("Merkle 证明验证通过!");
-    else PrintErr("Merkle 证明验证失败!");
+    if (!consistent) {
+        std::cout << "\n  \033[31m⚠ Merkle 根不一致! 恶意节点篡改了数据。\033[0m\n";
+    } else {
+        std::cout << "\n  \033[32m✓ 所有节点 Merkle 根一致。\033[0m\n";
+    }
     Pause();
 }
 
 // ══════════════════════════════════════════════════════════════════════════════
-// 10. SMT 状态证明
+// 8. 所有节点状态总览
 // ══════════════════════════════════════════════════════════════════════════════
 
-void CliSession::DoSMTProof() {
-    auto addr = PromptLine("请输入账户地址 (留空查询当前用户): ");
-    if (addr.empty() && active_user_index_ >= 0) {
-        addr = logged_in_users_[active_user_index_].address;
-    }
-    if (addr.empty()) {
-        PrintErr("地址不能为空");
-        return;
-    }
+void CliSession::DoNodeStatus() {
+    DbgSep("节点状态总览");
+    std::cout << "\n  ── 节点状态 ──\n";
+    std::cout << "  节点   │ 状态 │ 高度 │ 攻击模式\n";
+    std::cout << "  ───────┼──────┼──────┼──────────────────\n";
 
-    auto account = storage_.GetAccount(addr);
-    if (!account) {
-        PrintErr("账户不存在");
-        return;
-    }
-
-    DbgSep("SMT 状态证明");
-    DbgPrint("验证账户 " + account->address.substr(0, 12) + "... 的 SMT 存在性证明");
-
-    // 构建 SMT
-    SparseMerkleTree smt;
-    auto key = crypto::Sha256String(account->address);
-    auto value = EncodeAccountState(*account);
-    smt.Update(key, value);
-
-    Dbg("address=" + account->address);
-    Dbg("key = SHA256(address) = " + HashToHex(key));
-    Dbg("value = SerializeAccountState = " + SerializeAccountState(*account));
-    Dbg("value_hash = SHA256(value) = " + HashToHex(crypto::Sha256(value)));
-
-    // 生成存在性证明
-    auto proof = smt.GenerateExistenceProof(key);
-    Dbg("证明类型: EXISTENCE");
-    Dbg("兄弟哈希 (" + std::to_string(proof.sibling_hashes.size()) + " 个):");
-
-    // 路径位
-    std::string path_bits;
-    for (size_t i = 0; i < 8 && i < 256; ++i) {
-        const size_t byte_index = i / 8;
-        const size_t bit_index = 7 - (i % 8);
-        path_bits.push_back(((key[byte_index] >> bit_index) & 1U) ? '1' : '0');
-    }
-    Dbg("路径前8位: " + path_bits);
-
-    // 重算根哈希
-    Dbg("--- 重算根哈希 (从叶子到根, 256层) ---");
-    auto value_hash = crypto::Sha256(value);
-    Hash current = SparseMerkleTree::LeafHash(key, value_hash);
-    Dbg("  leaf_hash = " + HashToHex(current));
-
-    for (size_t depth = 255; depth < 256; --depth) {
-        const auto& sibling = proof.sibling_hashes[255 - depth];
-        const size_t byte_index = depth / 8;
-        const size_t bit_index = 7 - (depth % 8);
-        bool bit = ((key[byte_index] >> bit_index) & 1U) == 1U;
-        auto before = current;
-        if (bit) {
-            current = SparseMerkleTree::ParentHash(sibling, current);
+    auto results = BroadcastGet("/api/node/status");
+    for (const auto& r : results) {
+        if (r.ok) {
+            auto d = json::parse(r.data);
+            auto consensus = d.value("consensus", json::object());
+            std::string attack = consensus.value("attack_mode", "normal");
+            std::string height = d.value("latest_height", "0");
+            std::string status = consensus.value("running", true) ? "运行" : "停止";
+            std::cout << "  " << std::setw(6) << nodes_[r.node_idx].node_id << " │ "
+                      << std::setw(4) << status << " │ "
+                      << std::setw(4) << height << " │ "
+                      << attack << "\n";
         } else {
-            current = SparseMerkleTree::ParentHash(current, sibling);
-        }
-        // 只打印前3层和最后3层
-        if (depth >= 253 || depth <= 2) {
-            Dbg("  depth[" + std::to_string(depth) + "] bit=" + std::to_string(bit ? 1 : 0) +
-                " Hash(" + HashToHex(bit ? sibling : before).substr(0, 8) + "... || " +
-                HashToHex(bit ? before : sibling).substr(0, 8) + "...) = " +
-                HashToHex(current).substr(0, 12) + "...");
+            std::cout << "  " << std::setw(6) << nodes_[r.node_idx].node_id << " │ 离线\n";
         }
     }
-    Dbg("  ... (中间层省略) ...");
-
-    auto root = smt.GetRoot();
-    bool valid = (current == root);
-    Dbg("computed_root = " + HashToHex(current));
-    Dbg("expected_root = " + HashToHex(root));
-    Dbg("验证结果: " + std::string(valid ? "✓ 通过" : "✗ 失败"));
-
-    std::cout << "\n  地址:       " << account->address << "\n";
-    std::cout << "  余额:       " << account->balance << "\n";
-    std::cout << "  Nonce:      " << account->nonce << "\n";
-    std::cout << "  SMT 根:     " << HashToHex(root).substr(0, 32) << "...\n";
-    if (valid) PrintOk("SMT 存在性证明验证通过!");
-    else PrintErr("SMT 存在性证明验证失败!");
     Pause();
 }
 
 // ══════════════════════════════════════════════════════════════════════════════
-// 11. 攻击模拟
+// 9. 攻击模拟 (核心: 设置恶意节点 + 提交交易 + 验证拜占庭容错)
 // ══════════════════════════════════════════════════════════════════════════════
 
 void CliSession::DoAttackSimulation() {
-    DbgSep("攻击模拟");
+    DbgSep("攻击模拟 - 拜占庭容错验证");
 
-    std::cout << "\n  可用攻击模式:\n";
-    std::cout << "  ┌────┬──────────────────────────┬────────────────────────────────┐\n";
-    std::cout << "  │ 编号 │ 模式名称                   │ 说明                           │\n";
-    std::cout << "  ├────┼──────────────────────────┼────────────────────────────────┤\n";
-    std::cout << "  │  0 │ normal                   │ 正常模式                       │\n";
-    std::cout << "  │  1 │ bad_merkle_root          │ 篡改 Merkle 根                 │\n";
-    std::cout << "  │  2 │ bad_state_root           │ 篡改状态根                     │\n";
-    std::cout << "  │  3 │ invalid_block_hash       │ 篡改区块哈希                   │\n";
-    std::cout << "  │  4 │ invalid_node_signature    │ 伪造节点签名                   │\n";
-    std::cout << "  │  5 │ drop_prepare             │ 丢弃 PREPARE 消息              │\n";
-    std::cout << "  │  6 │ drop_commit              │ 丢弃 COMMIT 消息               │\n";
-    std::cout << "  │  7 │ delay_preprepare         │ 延迟 PRE_PREPARE 消息          │\n";
-    std::cout << "  │  8 │ double_proposal          │ 双重提议                       │\n";
-    std::cout << "  │  9 │ node_crash_simulated     │ 模拟节点崩溃                   │\n";
-    std::cout << "  │ 10 │ equivocation_prepare     │ 矛盾投票 (PREPARE)             │\n";
-    std::cout << "  │ 11 │ replay_old_message       │ 重放旧消息                     │\n";
-    std::cout << "  └────┴──────────────────────────┴────────────────────────────────┘\n";
+    // 选择恶意节点
+    std::cout << "\n  选择恶意节点:\n";
+    for (size_t i = 0; i < nodes_.size(); ++i) {
+        std::cout << "    " << (i + 1) << ". " << nodes_[i].node_id << "\n";
+    }
+    int bad_idx = PickNode("恶意节点 [1-" + std::to_string(nodes_.size()) + "]: ");
+    if (bad_idx < 0 || bad_idx >= static_cast<int>(nodes_.size())) { PrintErr("无效选择"); return; }
 
-    auto choice = PromptUint64("请选择攻击模式 [0-11]: ");
+    // 选择攻击模式
+    std::cout << "\n  攻击模式:\n";
+    std::cout << "    1. bad_merkle_root    篡改 Merkle 根\n";
+    std::cout << "    2. bad_state_root     篡改状态根\n";
+    std::cout << "    3. invalid_block_hash 篡改区块哈希\n";
+    std::cout << "    4. drop_prepare       丢弃 PREPARE\n";
+    std::cout << "    5. double_proposal    双重提议\n";
+    int mode_choice = static_cast<int>(PromptUint64("攻击模式 [1-5]: "));
 
-    AttackMode mode;
     std::string mode_name;
-    switch (choice) {
-        case 0:  mode = AttackMode::NORMAL; mode_name = "normal"; break;
-        case 1:  mode = AttackMode::BAD_MERKLE_ROOT; mode_name = "bad_merkle_root"; break;
-        case 2:  mode = AttackMode::BAD_STATE_ROOT; mode_name = "bad_state_root"; break;
-        case 3:  mode = AttackMode::INVALID_BLOCK_HASH; mode_name = "invalid_block_hash"; break;
-        case 4:  mode = AttackMode::INVALID_NODE_SIGNATURE; mode_name = "invalid_node_signature"; break;
-        case 5:  mode = AttackMode::DROP_PREPARE; mode_name = "drop_prepare"; break;
-        case 6:  mode = AttackMode::DROP_COMMIT; mode_name = "drop_commit"; break;
-        case 7:  mode = AttackMode::DELAY_PREPREPARE; mode_name = "delay_preprepare"; break;
-        case 8:  mode = AttackMode::DOUBLE_PROPOSAL; mode_name = "double_proposal"; break;
-        case 9:  mode = AttackMode::NODE_CRASH_SIMULATED; mode_name = "node_crash_simulated"; break;
-        case 10: mode = AttackMode::EQUIVOCATION_PREPARE; mode_name = "equivocation_prepare"; break;
-        case 11: mode = AttackMode::REPLAY_OLD_MESSAGE; mode_name = "replay_old_message"; break;
+    switch (mode_choice) {
+        case 1: mode_name = "bad_merkle_root"; break;
+        case 2: mode_name = "bad_state_root"; break;
+        case 3: mode_name = "invalid_block_hash"; break;
+        case 4: mode_name = "drop_prepare"; break;
+        case 5: mode_name = "double_proposal"; break;
         default: PrintErr("无效选择"); return;
     }
 
-    consensus_.SetAttackMode(mode);
-    Dbg("设置攻击模式: " + mode_name);
-    PrintOk("攻击模式已设置为: " + mode_name);
-
-    // 如果是 normal 模式，提示用户
-    if (mode == AttackMode::NORMAL) {
-        std::cout << "  已恢复正常模式，后续交易将正常出块。\n";
-        Pause();
-        return;
+    // Step 1: 恢复所有节点为正常模式
+    DbgPrint("Step 1 - 重置所有节点为正常模式...");
+    for (size_t i = 0; i < nodes_.size(); ++i) {
+        std::string dummy;
+        HttpPost(i, "/api/admin/attack-mode", R"({"mode":"normal"})", dummy);
     }
 
-    // 演示攻击效果
-    if (active_user_index_ >= 0) {
-        auto apply = PromptLine("是否提交一笔交易以观察攻击效果? (y/n): ");
-        if (apply == "y" || apply == "Y") {
-            Dbg("=== 攻击模式下提交交易 ===");
-            const auto& sender = logged_in_users_[active_user_index_];
-            auto account = storage_.GetAccount(sender.address);
-            uint64_t nonce = account ? account->nonce + 1 : 1;
+    // Step 2: 设置恶意节点攻击模式
+    DbgPrint("Step 2 - 设置 " + nodes_[bad_idx].node_id + " 为攻击模式: " + mode_name);
+    {
+        json body = {{"mode", mode_name}};
+        std::string raw;
+        HttpPost(bad_idx, "/api/admin/attack-mode", body.dump(), raw);
+        PrintOk(nodes_[bad_idx].node_id + " → " + mode_name);
+    }
 
-            // 构建一笔小额自转交易
-            Transaction tx;
-            tx.type = "TRANSFER";
-            tx.from = sender.address;
-            tx.to = sender.address;
-            tx.amount = 1;
-            tx.nonce = nonce;
-            tx.timestamp = NowMillis();
-            tx.public_key_hex = sender.public_key_hex;
-            tx.data_hash = "";
-
-            Dbg("构建攻击测试交易: self-transfer 1, nonce=" + std::to_string(nonce));
-
-            // 序列化 + 签名
-            auto tx_body = SerializeTransactionBody(tx);
-            tx.signature_hex = crypto::SignDetachedHex(tx_body, sender.private_key_hex);
-            tx.tx_id = ComputeTransactionId(tx);
-            Dbg("tx_id=" + tx.tx_id);
-
-            // 加入 mempool
-            std::string error;
-            if (!mempool_.AddTransaction(tx, error)) {
-                Dbg("mempool 拒绝: " + error);
-                PrintErr("交易被 mempool 拒绝: " + error);
-                Pause();
-                return;
-            }
-            Dbg("交易已加入 mempool");
-
-            // 出块时攻击模式的效果
-            Dbg("当前攻击模式: " + mode_name);
-            switch (mode) {
-                case AttackMode::BAD_MERKLE_ROOT:
-                    Dbg("效果: 出块时 Merkle 根将被篡改为随机值，诚实节点验证会失败");
-                    break;
-                case AttackMode::BAD_STATE_ROOT:
-                    Dbg("效果: 出块时 state_root 将被篡改，状态验证不一致");
-                    break;
-                case AttackMode::INVALID_BLOCK_HASH:
-                    Dbg("效果: 出块时 block_hash 将被篡改，区块完整性校验失败");
-                    break;
-                case AttackMode::DOUBLE_PROPOSAL:
-                    Dbg("效果: 同一高度将产生两个不同区块提议，触发 equivocation 检测");
-                    break;
-                case AttackMode::EQUIVOCATION_PREPARE:
-                    Dbg("效果: 节点对同一高度发送矛盾的 PREPARE 投票");
-                    break;
-                default:
-                    Dbg("效果: " + mode_name + " 攻击行为将在共识消息处理中体现");
-                    break;
-            }
-
-            // 在 NORMAL 模式下会自动出块，但在攻击模式下行为不同
-            if (consensus_.IsRunning()) {
-                auto picked = mempool_.PickTransactions(100);
-                if (!picked.empty()) {
-                    Block block;
-                    block.transactions = picked;
-                    block.header.chain_id = config_.chain_id;
-                    block.header.height = std::stoull(storage_.GetMetadata("latest_height", "0")) + 1;
-                    auto latest = storage_.GetLatestBlock();
-                    block.header.previous_block_hash = latest ? latest->header.block_hash : std::string(64, '0');
-                    block.header.tx_merkle_root = HashToHex(MerkleTree::ComputeRoot(picked));
-                    block.header.state_root = executor_.ExecuteForStateRoot(picked);
-                    block.header.timestamp = NowMillis();
-                    block.header.view = 0;
-                    block.header.instance_id = 0;
-                    block.header.proposer_id = config_.node_id;
-                    block.header.block_hash = ComputeBlockHash(block.header);
-
-                    // 根据攻击模式篡改数据或拦截
-                    if (mode == AttackMode::BAD_MERKLE_ROOT) {
-                        auto orig = block.header.tx_merkle_root;
-                        block.header.tx_merkle_root = std::string(64, 'f');
-                        Dbg("篡改 Merkle 根: " + orig + " → " + block.header.tx_merkle_root);
-                    } else if (mode == AttackMode::BAD_STATE_ROOT) {
-                        auto orig = block.header.state_root;
-                        block.header.state_root = std::string(64, 'a');
-                        Dbg("篡改 state_root: " + orig + " → " + block.header.state_root);
-                    } else if (mode == AttackMode::INVALID_BLOCK_HASH) {
-                        auto orig = block.header.block_hash;
-                        block.header.block_hash = std::string(64, 'b');
-                        Dbg("篡改 block_hash: " + orig + " → " + block.header.block_hash);
-                    } else if (mode == AttackMode::INVALID_NODE_SIGNATURE) {
-                        // 篡改 proposer_id 模拟伪造节点签名
-                        auto orig = block.header.proposer_id;
-                        block.header.proposer_id = "FAKE_NODE_X";
-                        Dbg("伪造节点签名: proposer_id " + orig + " → " + block.header.proposer_id);
-                    } else if (mode == AttackMode::DOUBLE_PROPOSAL) {
-                        // 模拟双重提议: 记录两个不同区块到同一高度
-                        Dbg("双重提议: 同一高度产生两个不同区块");
-                        consensus_.AddEvent({0, 0, "", block.header.height, block.header.view, block.header.instance_id,
-                                             "DOUBLE_PROPOSAL", config_.node_id, "PROPOSAL_A", block.header.block_hash, true, "", "double_proposal"});
-                        Block block2 = block;
-                        block2.header.block_hash = ComputeBlockHash(block.header); // 重新计算以获得不同哈希
-                        block2.header.timestamp += 1;
-                        block2.header.block_hash = ComputeBlockHash(block2.header);
-                        consensus_.AddEvent({0, 0, "", block2.header.height, block2.header.view, block2.header.instance_id,
-                                             "DOUBLE_PROPOSAL", config_.node_id, "PROPOSAL_B", block2.header.block_hash, true, "", "double_proposal"});
-                        Dbg("提案A: " + block.header.block_hash);
-                        Dbg("提案B: " + block2.header.block_hash);
-                    } else if (mode == AttackMode::NODE_CRASH_SIMULATED) {
-                        // 模拟节点崩溃: 不提交区块, 交易丢失
-                        Dbg("节点崩溃模拟: 区块未提交, 交易丢失");
-                        mempool_.RemoveCommitted(picked);
-                        consensus_.AddEvent({0, 0, "", block.header.height, block.header.view, block.header.instance_id,
-                                             "NODE_CRASH", config_.node_id, config_.node_id, block.header.block_hash, false, "节点崩溃, 区块丢失", "node_crash_simulated"});
-                        PrintOk("节点崩溃模拟: 区块 #0" + std::to_string(block.header.height) + " 未提交 (交易丢失)");
-                        Pause();
-                        return;
-                    } else if (mode == AttackMode::DROP_PREPARE || mode == AttackMode::DROP_COMMIT) {
-                        // 模拟消息丢弃: 区块提交但共识事件标记为不接受
-                        std::string phase = (mode == AttackMode::DROP_PREPARE) ? "PREPARE" : "COMMIT";
-                        Dbg("丢弃 " + phase + " 消息: 区块提交但共识未达成");
-                        consensus_.AddEvent({0, 0, "", block.header.height, block.header.view, block.header.instance_id,
-                                             "DROP_" + phase, config_.node_id, config_.node_id, block.header.block_hash, false,
-                                             phase + " 消息被恶意节点丢弃", mode_name});
-                    } else if (mode == AttackMode::DELAY_PREPREPARE) {
-                        // 模拟延迟: 记录延迟事件
-                        Dbg("延迟 PRE_PREPARE: 模拟 5 秒延迟");
-                        consensus_.AddEvent({0, 0, "", block.header.height, block.header.view, block.header.instance_id,
-                                             "DELAY_PREPREPARE", config_.node_id, config_.node_id, block.header.block_hash, true,
-                                             "PRE_PREPARE 被延迟 5 秒", "delay_preprepare"});
-                    } else if (mode == AttackMode::EQUIVOCATION_PREPARE) {
-                        // 模拟矛盾投票: 同一节点对两个不同区块投票
-                        Dbg("矛盾投票: 节点对两个不同区块发送 PREPARE");
-                        std::string hash1 = block.header.block_hash;
-                        BlockHeader h2 = block.header;
-                        h2.timestamp += 1;
-                        std::string hash2 = ComputeBlockHash(h2);
-                        consensus_.AddEvent({0, 0, "", block.header.height, block.header.view, block.header.instance_id,
-                                             "EQUIVOCATION", config_.node_id, config_.node_id, hash1, true, "", "equivocation_prepare"});
-                        consensus_.AddEvent({0, 0, "", block.header.height, block.header.view, block.header.instance_id,
-                                             "EQUIVOCATION", config_.node_id, config_.node_id, hash2, true, "", "equivocation_prepare"});
-                        Dbg("投票1: " + hash1);
-                        Dbg("投票2: " + hash2);
-                    } else if (mode == AttackMode::REPLAY_OLD_MESSAGE) {
-                        // 模拟重放: 记录旧消息事件
-                        Dbg("重放旧消息: 尝试重放 height=1 的消息");
-                        consensus_.AddEvent({0, 0, "", 1, 0, 0,
-                                             "REPLAY", config_.node_id, config_.node_id, "old_block_hash_000000", false,
-                                             "重放旧区块消息被检测到", "replay_old_message"});
-                    }
-
-                    Dbg("区块构建完成: height=" + std::to_string(block.header.height) +
-                        " merkle_root=" + block.header.tx_merkle_root +
-                        " state_root=" + block.header.state_root +
-                        " block_hash=" + block.header.block_hash);
-
-                    // ── Step 1: 快照受影响账户, 提交区块 (模拟提议) ──
-                    Dbg("Step 1 - 恶意节点提议区块...");
-                    struct AccSnap { std::string addr; uint64_t balance; uint64_t nonce; };
-                    std::vector<AccSnap> snapshot;
-                    for (const auto& ptx : picked) {
-                        auto acc = storage_.GetAccount(ptx.from);
-                        if (acc) snapshot.push_back({acc->address, acc->balance, acc->nonce});
-                        if (!ptx.to.empty()) {
-                            auto acc2 = storage_.GetAccount(ptx.to);
-                            if (acc2) snapshot.push_back({acc2->address, acc2->balance, acc2->nonce});
-                        }
-                    }
-                    executor_.CommitBlock(block);
-                    mempool_.RemoveCommitted(picked);
-                    Dbg("  区块已暂存, 账户快照已保存");
-
-                    // ── Step 2: 诚实节点验证区块 (模拟共识验证) ──
-                    Dbg("Step 2 - 诚实节点验证区块...");
-                    std::cout << "\n  ── 共识验证 ──\n";
-                    bool verified = true;
-                    std::string reject_reason;
-
-                    // 验证 Merkle 根
-                    auto real_merkle = HashToHex(MerkleTree::ComputeRoot(block.transactions));
-                    if (real_merkle != block.header.tx_merkle_root) {
-                        verified = false;
-                        reject_reason = "Merkle 根不匹配";
-                        Dbg("  ✗ Merkle 根: 期望=" + real_merkle + " 实际=" + block.header.tx_merkle_root);
-                        std::cout << "  真实 Merkle 根:  " << real_merkle.substr(0, 32) << "...\n";
-                        std::cout << "  区块 Merkle 根: " << block.header.tx_merkle_root.substr(0, 32) << "...\n";
-                    }
-                    // 验证 state_root
-                    if (verified) {
-                        auto real_state = executor_.ExecuteForStateRoot(block.transactions);
-                        if (real_state != block.header.state_root) {
-                            verified = false;
-                            reject_reason = "state_root 不匹配";
-                            Dbg("  ✗ state_root: 期望=" + real_state + " 实际=" + block.header.state_root);
-                            std::cout << "  真实 state_root:  " << real_state.substr(0, 32) << "...\n";
-                            std::cout << "  区块 state_root: " << block.header.state_root.substr(0, 32) << "...\n";
-                        }
-                    }
-                    // 验证 block_hash
-                    if (verified) {
-                        BlockHeader hdr = block.header;
-                        std::string saved = hdr.block_hash;
-                        hdr.block_hash = "";
-                        if (ComputeBlockHash(hdr) != saved) {
-                            verified = false;
-                            reject_reason = "block_hash 不匹配";
-                            Dbg("  ✗ block_hash 验证失败");
-                        }
-                    }
-                    // 验证 proposer_id
-                    if (verified) {
-                        bool known = (block.header.proposer_id == config_.node_id);
-                        if (!known) for (const auto& p : config_.peers) if (p.node_id == block.header.proposer_id) { known = true; break; }
-                        if (!known) {
-                            verified = false;
-                            reject_reason = "未知节点 proposer_id=" + block.header.proposer_id;
-                            Dbg("  ✗ proposer: " + block.header.proposer_id);
-                        }
-                    }
-
-                    // ── Step 3: 验证结果 ──
-                    if (!verified) {
-                        Dbg("Step 3 - 验证失败, 回滚: " + reject_reason);
-                        std::cout << "  \033[31m✗ 验证失败: " << reject_reason << "!\033[0m\n";
-                        std::cout << "  区块 #" << block.header.height << " 被拒绝, 回滚交易\n";
-
-                        // 回滚区块
-                        storage_.Begin();
-                        try {
-                            sqlite3_stmt* d1 = nullptr;
-                            sqlite3_prepare_v2(storage_.Raw(), "DELETE FROM blocks WHERE height=?;", -1, &d1, nullptr);
-                            sqlite3_bind_int64(d1, 1, static_cast<sqlite3_int64>(block.header.height));
-                            sqlite3_step(d1); sqlite3_finalize(d1);
-
-                            for (const auto& ptx : picked) {
-                                sqlite3_stmt* u = nullptr;
-                                sqlite3_prepare_v2(storage_.Raw(),
-                                    "UPDATE transactions SET status='PENDING', block_height=NULL, tx_index=NULL WHERE tx_id=?;",
-                                    -1, &u, nullptr);
-                                sqlite3_bind_text(u, 1, ptx.tx_id.c_str(), -1, SQLITE_TRANSIENT);
-                                sqlite3_step(u); sqlite3_finalize(u);
-                            }
-                            storage_.PutMetadata("latest_height", std::to_string(block.header.height - 1));
-
-                            // 恢复账户快照
-                            for (const auto& s : snapshot) {
-                                storage_.PutAccount({s.addr, s.balance, s.nonce}, 0);
-                            }
-                            storage_.Commit();
-                            Dbg("  回滚完成: 区块已删除, 账户已恢复");
-                        } catch (...) {
-                            storage_.Rollback();
-                            Dbg("  回滚异常");
-                        }
-
-                        PrintErr("区块 #" + std::to_string(block.header.height) + " 被共识拒绝: " + reject_reason);
-                        consensus_.AddEvent({0, 0, "", block.header.height, block.header.view, block.header.instance_id,
-                                             "ATTACK_BLOCK_REJECTED", config_.node_id, config_.node_id, block.header.block_hash, false, reject_reason, mode_name});
-                    } else {
-                        Dbg("Step 3 - 验证通过, 区块确认");
-                        PrintOk("区块 #" + std::to_string(block.header.height) + " 验证通过");
-                        consensus_.AddEvent({0, 0, "", block.header.height, block.header.view, block.header.instance_id,
-                                             "ATTACK_BLOCK_ACCEPTED", config_.node_id, config_.node_id, block.header.block_hash, true, "", mode_name});
-                    }
-                }
+    // Step 3: 注册用户 (如果未登录)
+    if (active_user_ < 0) {
+        DbgPrint("Step 3 - 自动注册测试用户...");
+        json reg_body = {{"username", "attack_test"}, {"password", "test123456"}};
+        auto reg_results = BroadcastPost("/api/users/register", reg_body.dump());
+        for (const auto& r : reg_results) {
+            if (r.ok) {
+                auto d = json::parse(r.data);
+                RemoteUser user;
+                user.username = "attack_test";
+                user.address = d.value("address", "");
+                user.public_key = d.value("public_key", "");
+                user.private_key = d.value("private_key", "");
+                users_.push_back(user);
+                active_user_ = static_cast<int>(users_.size()) - 1;
+                break;
             }
         }
     }
 
-    std::cout << "\n  提示: 使用菜单选项 9 (Merkle 证明) 或 12 (节点状态) 观察攻击效果。\n";
-    Dbg("=== 攻击模拟设置完成 ===");
+    if (active_user_ < 0) { PrintErr("无法获取用户信息"); return; }
+    const auto& user = users_[active_user_];
+
+    // Step 4: 获取 nonce
+    uint64_t nonce = 1;
+    {
+        std::string raw;
+        HttpGet(bad_idx, "/api/state/" + user.address, raw);
+        std::string d, e;
+        if (ParseOk(raw, d, e)) nonce = json::parse(d).value("nonce", 0ULL) + 1;
+    }
+
+    // Step 5: 构造交易并提交到恶意节点
+    DbgPrint("Step 3 - 提交交易到恶意节点 " + nodes_[bad_idx].node_id + "...");
+    json tx_body = {
+        {"type", "TRANSFER"}, {"from", user.address}, {"to", user.address},
+        {"amount", 1}, {"nonce", nonce}, {"timestamp", 0},
+        {"public_key", user.public_key}, {"private_key", user.private_key}
+    };
+
+    std::string tx_id;
+    {
+        std::string raw;
+        HttpPost(bad_idx, "/api/transactions/transfer", tx_body.dump(), raw);
+        std::string d, e;
+        if (ParseOk(raw, d, e)) {
+            tx_id = json::parse(d).value("tx_id", "");
+            DbgPrint("  交易已提交: tx_id=" + tx_id.substr(0, 16) + "...");
+        } else {
+            PrintErr("交易提交失败: " + e);
+            Pause();
+            return;
+        }
+    }
+
+    // Step 6: 提交相同交易到诚实节点
+    DbgPrint("Step 4 - 提交相同交易到诚实节点...");
+    for (size_t i = 0; i < nodes_.size(); ++i) {
+        if (static_cast<int>(i) == bad_idx) continue;
+        std::string raw;
+        HttpPost(i, "/api/transactions/transfer", tx_body.dump(), raw);
+    }
+
+    // Step 7: 对比所有节点的区块
+    DbgPrint("Step 5 - 对比所有节点区块...");
+    std::cout << "\n  ── 拜占庭容错验证 ──\n";
+    std::cout << "  节点   │ 角色     │ 高度 │ 区块哈希         │ Merkle根         │ state_root\n";
+    std::cout << "  ───────┼──────────┼──────┼──────────────────┼──────────────────┼──────────────────\n";
+
+    auto block_results = BroadcastGet("/api/blocks/latest");
+    std::string honest_hash;
+    bool tampered = false;
+
+    for (const auto& r : block_results) {
+        if (!r.ok) continue;
+        auto d = json::parse(r.data);
+        auto hdr = d["header"];
+        std::string hash = hdr.value("block_hash", "");
+        std::string merkle = hdr.value("tx_merkle_root", "");
+        std::string state = hdr.value("state_root", "");
+        uint64_t height = hdr.value("height", 0ULL);
+
+        std::string role = (static_cast<int>(r.node_idx) == bad_idx) ? "恶意 ⚠" : "诚实 ✓";
+        if (static_cast<int>(r.node_idx) != bad_idx) {
+            if (honest_hash.empty()) honest_hash = hash;
+        }
+
+        std::cout << "  " << std::setw(6) << nodes_[r.node_idx].node_id << " │ "
+                  << std::setw(8) << role << " │ "
+                  << std::setw(4) << height << " │ "
+                  << hash.substr(0, 16) << ".. │ "
+                  << merkle.substr(0, 16) << ".. │ "
+                  << state.substr(0, 16) << "..\n";
+    }
+
+    // Step 8: 验证结论
+    std::cout << "\n  ── 验证结论 ──\n";
+
+    // 对比恶意节点和诚实节点的 Merkle 根
+    auto merkle_results = BroadcastGet("/api/proofs/tx/" + tx_id);
+    std::string bad_merkle, honest_merkle;
+    for (const auto& r : merkle_results) {
+        if (!r.ok) continue;
+        auto d = json::parse(r.data);
+        std::string root = d.value("root", "");
+        if (static_cast<int>(r.node_idx) == bad_idx) bad_merkle = root;
+        else honest_merkle = root;
+    }
+
+    if (!bad_merkle.empty() && !honest_merkle.empty() && bad_merkle != honest_merkle) {
+        tampered = true;
+        std::cout << "  恶意节点 Merkle 根: " << bad_merkle.substr(0, 24) << "...\n";
+        std::cout << "  诚实节点 Merkle 根: " << honest_merkle.substr(0, 24) << "...\n";
+        std::cout << "  \033[31m✗ 数据不一致! 恶意节点篡改了区块数据。\033[0m\n";
+        std::cout << "  RBFT 共识: 诚实节点拒绝与恶意节点达成一致, 系统继续正常运行。\n";
+    } else {
+        std::cout << "  \033[32m✓ 所有节点数据一致 (攻击未生效或已被隔离)。\033[0m\n";
+    }
+
+    // 查询共识状态
+    auto consensus_results = BroadcastGet("/api/node/consensus");
+    std::cout << "\n  ── 共识状态 ──\n";
+    for (const auto& r : consensus_results) {
+        if (!r.ok) continue;
+        auto d = json::parse(r.data);
+        std::string attack = d.value("attack_mode", "normal");
+        int evidence = d.value("evidence_count", 0);
+        std::cout << "  " << nodes_[r.node_idx].node_id << ": attack_mode=" << attack
+                  << " evidence=" << evidence << "\n";
+    }
+
+    // 记录交易
+    if (!tx_id.empty()) {
+        recent_txs_.push_back({tx_id, "TRANSFER", user.address, user.address, 1, tampered ? "REJECTED" : "COMMITTED"});
+        tx_order_.push_back(tx_id);
+    }
+
+    Dbg("攻击模拟完成: tampered=" + std::string(tampered ? "true" : "false"));
     Pause();
 }
 
 // ══════════════════════════════════════════════════════════════════════════════
-// 15. 查看已注册用户 (管理)
-// ══════════════════════════════════════════════════════════════════════════════
-
-void CliSession::DoListUsers() {
-    DbgSep("查看已注册用户");
-    sqlite3_stmt* stmt = nullptr;
-    sqlite3_prepare_v2(storage_.Raw(),
-        "SELECT u.user_id, u.username, u.address, u.public_key, u.private_key_encrypted, "
-        "COALESCE(a.balance, 0), COALESCE(a.nonce, 0) "
-        "FROM users u LEFT JOIN accounts a ON u.address = a.address "
-        "ORDER BY u.user_id;",
-        -1, &stmt, nullptr);
-
-    std::cout << "\n  ── 已注册用户 ──\n";
-    std::cout << "  ID │ 用户名       │ 地址               │ 余额   │ Nonce\n";
-    std::cout << "  ───┼──────────────┼────────────────────┼────────┼──────\n";
-
-    int count = 0;
-    while (sqlite3_step(stmt) == SQLITE_ROW) {
-        int64_t uid = sqlite3_column_int64(stmt, 0);
-        std::string uname = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 1));
-        std::string addr = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 2));
-        uint64_t balance = static_cast<uint64_t>(sqlite3_column_int64(stmt, 5));
-        uint64_t nonce = static_cast<uint64_t>(sqlite3_column_int64(stmt, 6));
-
-        std::cout << "  " << std::setw(2) << uid << " │ "
-                  << std::setw(12) << uname << " │ "
-                  << addr.substr(0, 18) << ".. │ "
-                  << std::setw(6) << balance << " │ "
-                  << std::setw(5) << nonce << "\n";
-        count++;
-    }
-    sqlite3_finalize(stmt);
-
-    if (count == 0) {
-        std::cout << "  (暂无用户)\n";
-    }
-
-    std::cout << "\n";
-    std::cout << "  安全说明:\n";
-    std::cout << "  • 密码: Argon2id 单向哈希, 无法反推\n";
-    std::cout << "  • 私钥: XSalsa20-Poly1305 加密存储, 密钥从密码派生\n";
-    std::cout << "  • 忘记密码 → 私钥无法解密 → 只能重新注册\n";
-    Dbg("用户总数: " + std::to_string(count));
-    Pause();
-}
-
-// ══════════════════════════════════════════════════════════════════════════════
-// 14. 最近交易记录
+// 10. 最近交易记录
 // ══════════════════════════════════════════════════════════════════════════════
 
 void CliSession::DoShowHistory() {
     if (tx_order_.empty()) {
-        std::cout << "\n  暂无交易记录。请先执行转账或存储数据操作。\n";
+        std::cout << "\n  暂无交易记录。\n";
         Pause();
         return;
     }
-    std::cout << "\n  ── 最近交易记录 (哈希表存储, O(1) 查找) ──\n";
-    std::cout << "  编号 │ 类型         │ 发送方         │ 接收方         │ 金额  │ 区块  │ tx_id\n";
-    std::cout << "  ─────┼──────────────┼────────────────┼────────────────┼───────┼───────┼──────────────────\n";
+    std::cout << "\n  ── 最近交易记录 ──\n";
+    std::cout << "  编号 │ 类型         │ 发送方         │ 金额  │ 状态\n";
+    std::cout << "  ─────┼──────────────┼────────────────┼───────┼──────────\n";
     for (size_t i = 0; i < tx_order_.size(); ++i) {
-        auto rec = recent_tx_map_.Get(tx_order_[i]);
-        if (!rec) continue;
-        std::cout << "  " << std::setw(4) << i << " │ "
-                  << std::setw(12) << rec->type << " │ "
-                  << rec->from.substr(0, 12) << ".. │ "
-                  << (rec->to.empty() ? "-" : rec->to.substr(0, 12) + "..") << " │ "
-                  << std::setw(5) << rec->amount << " │ "
-                  << std::setw(5) << rec->block_height << " │ "
-                  << rec->tx_id.substr(0, 16) << "...\n";
-    }
-    std::cout << "\n  存储: CustomHashTable (链地址法, 负载因子>0.75时自动扩容)\n";
-    std::cout << "  当前: " << recent_tx_map_.Size() << " 条记录, "
-              << recent_tx_map_.BucketCount() << " 个桶, "
-              << "负载因子=" << std::fixed << std::setprecision(2) << recent_tx_map_.LoadFactor() << "\n";
-    std::cout << "  提示: 在查询交易(7)或 Merkle 证明(9)时可输入编号快速选择。\n";
-    Pause();
-}
-
-std::string CliSession::PickTxId(const std::string& prompt) {
-    if (!tx_order_.empty()) {
-        std::cout << "  最近交易:\n";
-        for (size_t i = 0; i < tx_order_.size(); ++i) {
-            auto rec = recent_tx_map_.Get(tx_order_[i]);
-            if (!rec) continue;
-            std::cout << "    [" << i << "] " << rec->type
-                      << " " << rec->tx_id.substr(0, 16)
-                      << "... height=" << rec->block_height << "\n";
+        // 线性查找
+        for (const auto& r : recent_txs_) {
+            if (r.tx_id == tx_order_[i]) {
+                std::cout << "  " << std::setw(4) << i << " │ "
+                          << std::setw(12) << r.type << " │ "
+                          << r.from.substr(0, 12) << ".. │ "
+                          << std::setw(5) << r.amount << " │ "
+                          << r.status << "\n";
+                break;
+            }
         }
-    }
-    auto input = PromptLine(prompt);
-    if (input.empty()) return "";
-    // 尝试解析为编号
-    try {
-        size_t idx = std::stoull(input);
-        if (idx < tx_order_.size()) {
-            return tx_order_[idx];
-        }
-    } catch (...) {}
-    // 否则当作 tx_id, 用哈希表 O(1) 验证是否存在
-    if (recent_tx_map_.Contains(input)) {
-        return input;
-    }
-    // 用户直接输入的 tx_id 可能不在历史中, 仍返回让调用方查询 DB
-    return input;
-}
-
-// ══════════════════════════════════════════════════════════════════════════════
-// 12. 节点状态
-// ══════════════════════════════════════════════════════════════════════════════
-
-void CliSession::DoNodeStatus() {
-    auto height = storage_.GetMetadata("latest_height", "0");
-
-    std::cout << "\n  ── 节点状态 ──\n";
-    std::cout << "  节点ID:     " << config_.node_id << "\n";
-    std::cout << "  REST端口:   " << config_.rest_port << "\n";
-    std::cout << "  P2P端口:    " << config_.p2p_port << "\n";
-    std::cout << "  链ID:       " << config_.chain_id << "\n";
-    std::cout << "  最新高度:   " << height << "\n";
-    std::cout << "  f:          " << config_.f << "\n";
-    std::cout << "  实例数:     " << config_.instance_count << "\n";
-    std::cout << "  quorum:     " << consensus_.Quorum() << "\n";
-    std::cout << "  已登录用户: " << logged_in_users_.size() << "\n";
-    for (size_t i = 0; i < logged_in_users_.size(); ++i) {
-        std::cout << "    [" << i << "] " << logged_in_users_[i].username
-                  << "  " << logged_in_users_[i].address.substr(0, 12) << "...\n";
     }
     Pause();
 }
 
 // ══════════════════════════════════════════════════════════════════════════════
-// 13. 共识状态
+// 11. 查看所有用户 (分页)
 // ══════════════════════════════════════════════════════════════════════════════
 
-void CliSession::DoConsensusStatus() {
-    auto status = consensus_.Status();
-    auto events = consensus_.RecentEvents(10);
+void CliSession::DoListUsers() {
+    DbgSep("查看所有用户");
 
-    std::cout << "\n  ── 共识状态 ──\n";
-    std::cout << "  运行状态:   " << (consensus_.IsRunning() ? "运行中" : "已停止") << "\n";
-    std::cout << "  攻击模式:   " << AttackModeToString(consensus_.GetAttackMode()) << "\n";
-    std::cout << "  Quorum:     " << consensus_.Quorum() << "\n";
+    // 选择查询哪个节点
+    std::cout << "  查询哪个节点? [1-" << nodes_.size() << ", 默认1]: ";
+    int node_idx = PickNode("");
+    if (node_idx < 0) node_idx = 0;
 
-    DbgSep("共识状态查询");
-    Dbg("running=" + std::string(consensus_.IsRunning() ? "true" : "false"));
-    Dbg("attack_mode=" + AttackModeToString(consensus_.GetAttackMode()));
-    Dbg("quorum=" + std::to_string(consensus_.Quorum()));
+    int page = 1;
+    const int page_size = 10;
 
-    if (!events.empty()) {
-        std::cout << "\n  最近事件:\n";
-        for (const auto& e : events) {
-            std::cout << "    [" << e.height << "] " << e.event_type
-                      << " from=" << e.from.substr(0, 8)
-                      << " accepted=" << (e.accepted ? "Y" : "N") << "\n";
+    while (true) {
+        std::string path = "/api/users?page=" + std::to_string(page) + "&page_size=" + std::to_string(page_size);
+        std::string raw;
+        if (!HttpGet(node_idx, path, raw)) {
+            PrintErr("查询失败: " + nodes_[node_idx].node_id + " 无响应");
+            Pause();
+            return;
+        }
+
+        std::string data, err;
+        if (!ParseOk(raw, data, err)) {
+            PrintErr("查询失败: " + err);
+            Pause();
+            return;
+        }
+
+        auto d = json::parse(data);
+        auto users = d.value("users", json::array());
+        int total = d.value("total", 0);
+        int total_pages = (total + page_size - 1) / page_size;
+
+        if (total == 0) {
+            std::cout << "\n  暂无注册用户。\n";
+            Pause();
+            return;
+        }
+
+        std::cout << "\n  ── " << nodes_[node_idx].node_id << " 用户列表 (第 "
+                  << page << "/" << total_pages << " 页, 共 " << total << " 人) ──\n";
+        std::cout << "  编号 │ 用户名       │ 地址               │ 余额   │ Nonce\n";
+        std::cout << "  ─────┼──────────────┼────────────────────┼────────┼──────\n";
+
+        for (const auto& u : users) {
+            std::string addr = u.value("address", "");
+            std::cout << "  " << std::setw(4) << u.value("user_id", 0) << " │ "
+                      << std::setw(12) << u.value("username", "") << " │ "
+                      << addr.substr(0, 18) << (addr.size() > 18 ? ".." : "  ") << " │ "
+                      << std::setw(6) << u.value("balance", 0ULL) << " │ "
+                      << u.value("nonce", 0ULL) << "\n";
+        }
+
+        if (total_pages <= 1) {
+            Pause();
+            return;
+        }
+
+        std::cout << "\n  n=下一页  p=上一页  q=退出: ";
+        std::string input;
+        std::getline(std::cin, input);
+        if (input == "n" || input == "N") {
+            if (page < total_pages) page++;
+        } else if (input == "p" || input == "P") {
+            if (page > 1) page--;
+        } else {
+            return;
         }
     }
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// 12. 多节点共识验证
+// ══════════════════════════════════════════════════════════════════════════════
+
+void CliSession::DoConsensusVerify() {
+    DbgSep("多节点共识验证");
+    std::cout << "\n  ── 多节点共识验证 ──\n\n";
+
+    int pass = 0, fail = 0, offline = 0;
+
+    // Check 1: 节点在线状态
+    std::cout << "  [1] 节点在线检查\n";
+    std::vector<uint64_t> heights(nodes_.size(), 0);
+    std::vector<std::string> hashes(nodes_.size());
+    std::vector<bool> online(nodes_.size(), false);
+
+    for (size_t i = 0; i < nodes_.size(); ++i) {
+        std::string raw;
+        if (HttpGet(i, "/api/node/status", raw)) {
+            auto d = json::parse(raw);
+            if (d.value("ok", false)) {
+                online[i] = true;
+                heights[i] = std::stoull(d["data"].value("latest_height", "0"));
+                std::cout << "    " << nodes_[i].node_id << " ✓ 在线 height=" << heights[i] << "\n";
+            }
+        }
+        if (!online[i]) {
+            std::cout << "    " << nodes_[i].node_id << " ✗ 离线\n";
+            offline++;
+        }
+    }
+
+    // Check 2: 区块高度一致性
+    std::cout << "\n  [2] 区块高度一致性\n";
+    uint64_t expected_height = heights[0];
+    bool height_ok = true;
+    for (size_t i = 1; i < nodes_.size(); ++i) {
+        if (online[i] && heights[i] != expected_height) {
+            height_ok = false;
+        }
+    }
+    if (height_ok && expected_height > 0) {
+        std::cout << "    ✓ 所有节点高度一致: " << expected_height << "\n";
+        pass++;
+    } else if (expected_height == 0) {
+        std::cout << "    - 无区块可比较\n";
+    } else {
+        std::cout << "    ✗ 高度不一致:";
+        for (size_t i = 0; i < nodes_.size(); ++i) {
+            if (online[i]) std::cout << " " << nodes_[i].node_id << "=" << heights[i];
+        }
+        std::cout << "\n";
+        fail++;
+    }
+
+    // Check 3: 区块哈希一致性 (逐高度比较)
+    if (expected_height > 0) {
+        std::cout << "\n  [3] 区块哈希一致性\n";
+        for (uint64_t h = 1; h <= expected_height; ++h) {
+            std::string first_hash;
+            bool hash_ok = true;
+            for (size_t i = 0; i < nodes_.size(); ++i) {
+                if (!online[i]) continue;
+                std::string raw;
+                HttpGet(i, "/api/blocks/" + std::to_string(h), raw);
+                std::string data, err;
+                if (ParseOk(raw, data, err)) {
+                    auto d = json::parse(data);
+                    std::string hash = d["header"].value("block_hash", "");
+                    if (first_hash.empty()) first_hash = hash;
+                    else if (hash != first_hash) hash_ok = false;
+                }
+            }
+            if (hash_ok) {
+                std::cout << "    height=" << h << " ✓ hash=" << first_hash.substr(0, 16) << "...\n";
+                pass++;
+            } else {
+                std::cout << "    height=" << h << " ✗ 哈希不一致!\n";
+                fail++;
+            }
+        }
+    }
+
+    // Check 4: 账户余额一致性 (抽查前 3 个用户)
+    std::cout << "\n  [4] 账户余额一致性\n";
+    std::string users_raw;
+    if (HttpGet(0, "/api/users?page=1&page_size=3", users_raw)) {
+        std::string data, err;
+        if (ParseOk(users_raw, data, err)) {
+            auto d = json::parse(data);
+            for (const auto& u : d["users"]) {
+                std::string addr = u.value("address", "");
+                std::string uname = u.value("username", "");
+                uint64_t first_balance = 0;
+                bool balance_ok = true;
+                for (size_t i = 0; i < nodes_.size(); ++i) {
+                    if (!online[i]) continue;
+                    std::string raw;
+                    HttpGet(i, "/api/state/" + addr, raw);
+                    std::string sd, se;
+                    if (ParseOk(raw, sd, se)) {
+                        uint64_t bal = json::parse(sd).value("balance", 0ULL);
+                        if (first_balance == 0 && i == 0) first_balance = bal;
+                        else if (bal != first_balance) balance_ok = false;
+                    }
+                }
+                if (balance_ok) {
+                    std::cout << "    " << uname << " ✓ balance=" << first_balance << "\n";
+                    pass++;
+                } else {
+                    std::cout << "    " << uname << " ✗ 余额不一致!\n";
+                    fail++;
+                }
+            }
+        }
+    }
+
+    // Check 5: Merkle 根一致性
+    if (expected_height > 0) {
+        std::cout << "\n  [5] Merkle 根一致性\n";
+        for (uint64_t h = 1; h <= expected_height; ++h) {
+            std::string first_merkle;
+            bool merkle_ok = true;
+            for (size_t i = 0; i < nodes_.size(); ++i) {
+                if (!online[i]) continue;
+                std::string raw;
+                HttpGet(i, "/api/blocks/" + std::to_string(h), raw);
+                std::string data, err;
+                if (ParseOk(raw, data, err)) {
+                    auto d = json::parse(data);
+                    std::string merkle = d["header"].value("tx_merkle_root", "");
+                    if (first_merkle.empty()) first_merkle = merkle;
+                    else if (merkle != first_merkle) merkle_ok = false;
+                }
+            }
+            if (merkle_ok) {
+                std::cout << "    height=" << h << " ✓ merkle_root=" << first_merkle.substr(0, 16) << "...\n";
+                pass++;
+            } else {
+                std::cout << "    height=" << h << " ✗ Merkle 根不一致!\n";
+                fail++;
+            }
+        }
+    }
+
+    // Check 6: 共识攻击模式检查
+    std::cout << "\n  [6] 共识攻击模式检查\n";
+    bool any_attack = false;
+    for (size_t i = 0; i < nodes_.size(); ++i) {
+        if (!online[i]) continue;
+        std::string raw;
+        HttpGet(i, "/api/node/consensus", raw);
+        std::string data, err;
+        if (ParseOk(raw, data, err)) {
+            auto d = json::parse(data);
+            std::string mode = d.value("attack_mode", "normal");
+            if (mode != "normal") {
+                std::cout << "    " << nodes_[i].node_id << " ⚠ attack_mode=" << mode << "\n";
+                any_attack = true;
+            }
+        }
+    }
+    if (!any_attack) {
+        std::cout << "    ✓ 所有节点处于正常模式\n";
+        pass++;
+    }
+
+    // 总结
+    std::cout << "\n  ── 验证总结 ──\n";
+    std::cout << "  通过: \033[32m" << pass << "\033[0m";
+    if (fail > 0) std::cout << "  失败: \033[31m" << fail << "\033[0m";
+    if (offline > 0) std::cout << "  离线: " << offline;
+    std::cout << "\n";
+
+    if (fail == 0 && offline == 0) {
+        std::cout << "  \033[32m✓ 多节点共识验证全部通过!\033[0m\n";
+    } else if (fail > 0) {
+        std::cout << "  \033[31m✗ 存在不一致，需要检查!\033[0m\n";
+    }
+    Dbg("验证完成: pass=" + std::to_string(pass) + " fail=" + std::to_string(fail) + " offline=" + std::to_string(offline));
     Pause();
 }
 

@@ -57,6 +57,47 @@ UserRecord UserManager::Register(const std::string& username, const std::string&
     }
 }
 
+UserRecord UserManager::RegisterWithKey(const std::string& username, const std::string& password,
+                                         const std::string& address, const std::string& public_key_hex,
+                                         const std::string& private_key_hex) {
+    if (username.size() < 3) {
+        throw std::invalid_argument("用户名至少需要 3 个字符");
+    }
+    if (password.size() < 6) {
+        throw std::invalid_argument("密码至少需要 6 个字符");
+    }
+    const std::string password_hash = crypto::PasswordHash(password);
+    const std::string encrypted_pk = crypto::EncryptSecret(private_key_hex, password);
+    const uint64_t now = NowMillis();
+
+    storage_->Begin();
+    try {
+        sqlite3_stmt* stmt = nullptr;
+        const char* sql = "INSERT INTO users(username,password_hash,address,public_key,private_key_encrypted,created_at) VALUES(?,?,?,?,?,?);";
+        sqlite3_prepare_v2(storage_->Raw(), sql, -1, &stmt, nullptr);
+        sqlite3_bind_text(stmt, 1, username.c_str(), -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text(stmt, 2, password_hash.c_str(), -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text(stmt, 3, address.c_str(), -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text(stmt, 4, public_key_hex.c_str(), -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text(stmt, 5, encrypted_pk.c_str(), -1, SQLITE_TRANSIENT);
+        sqlite3_bind_int64(stmt, 6, static_cast<sqlite3_int64>(now));
+        if (sqlite3_step(stmt) != SQLITE_DONE) {
+            sqlite3_finalize(stmt);
+            throw std::runtime_error("用户名 \"" + username + "\" 已存在");
+        }
+        int64_t user_id = sqlite3_last_insert_rowid(storage_->Raw());
+        sqlite3_finalize(stmt);
+        storage_->PutAccount(AccountState{address, 1000, 0}, 0);
+        storage_->Commit();
+        username_index_.Put(username, user_id);
+        address_index_.Put(address, user_id);
+        return UserRecord{user_id, username, address, public_key_hex, private_key_hex};
+    } catch (...) {
+        storage_->Rollback();
+        throw;
+    }
+}
+
 LoginResult UserManager::Login(const std::string& username, const std::string& password) {
     sqlite3_stmt* stmt = nullptr;
     sqlite3_prepare_v2(storage_->Raw(), "SELECT user_id,password_hash,address,public_key,private_key_encrypted FROM users WHERE username=?;", -1, &stmt, nullptr);

@@ -1,11 +1,9 @@
 #include "cli/cli_session.h"
-#include "common/config.h"
-#include "common/logger.h"
-#include "crypto/crypto_utils.h"
 
 #include <exception>
-#include <filesystem>
 #include <iostream>
+#include <string>
+#include <vector>
 
 static void PrintBanner() {
     std::cout << "\n";
@@ -15,70 +13,63 @@ static void PrintBanner() {
     std::cout << "\033[36m  ██╔══██╗██╔══██╗██╔══╝     ██║   \033[0m\n";
     std::cout << "\033[36m  ██║  ██║██║  ██║██║        ██║   \033[0m\n";
     std::cout << "\033[36m  ╚═╝  ╚═╝╚═╝  ╚═╝╚═╝        ╚═╝   \033[0m\n";
-    std::cout << "\033[1m  Chain Demo - 交互式命令行客户端\033[0m\n";
+    std::cout << "\033[1m  Chain Demo - 多节点共识客户端\033[0m\n";
     std::cout << "\n";
 }
 
 static void PrintUsage(const char* prog) {
     std::cout << "用法: " << prog << " [选项]\n";
     std::cout << "选项:\n";
-    std::cout << "  --config <path>  指定节点配置文件 (默认: config/node1.json)\n";
-    std::cout << "  --help           显示帮助信息\n";
+    std::cout << "  --nodes host:p1,p2,p3,p4  指定节点地址和端口 (默认: localhost:8001,8002,8003,8004)\n";
+    std::cout << "  --help                    显示帮助信息\n";
+    std::cout << "\n";
+    std::cout << "示例:\n";
+    std::cout << "  " << prog << "\n";
+    std::cout << "  " << prog << " --nodes 192.168.1.10:8001,8002,8003,8004\n";
 }
 
 int main(int argc, char** argv) {
     try {
-        std::string config_path;
+        std::string host = "localhost";
+        std::vector<int> ports = {8001, 8002, 8003, 8004};
 
         for (int i = 1; i < argc; ++i) {
             std::string arg = argv[i];
-            if (arg == "--config" && i + 1 < argc) {
-                config_path = argv[++i];
+            if (arg == "--nodes" && i + 1 < argc) {
+                std::string val = argv[++i];
+                auto colon = val.find(':');
+                if (colon != std::string::npos) {
+                    host = val.substr(0, colon);
+                    std::string ports_str = val.substr(colon + 1);
+                    ports.clear();
+                    size_t pos = 0;
+                    while (pos < ports_str.size()) {
+                        auto comma = ports_str.find(',', pos);
+                        if (comma == std::string::npos) comma = ports_str.size();
+                        ports.push_back(std::stoi(ports_str.substr(pos, comma - pos)));
+                        pos = comma + 1;
+                    }
+                }
             } else if (arg == "--help" || arg == "-h") {
                 PrintUsage(argv[0]);
                 return 0;
             }
         }
 
-        // 自动定位配置文件: 优先用户指定, 否则按 当前目录 → 上级目录 搜索
-        if (config_path.empty()) {
-            if (std::filesystem::exists("config/node1.json")) {
-                config_path = "config/node1.json";
-            } else if (std::filesystem::exists("../config/node1.json")) {
-                config_path = "../config/node1.json";
-            } else {
-                throw std::runtime_error(
-                    "找不到配置文件 config/node1.json\n"
-                    "请在项目根目录或 build 目录下运行, 或使用 --config <path> 指定");
-            }
+        // 构建节点端点列表
+        std::vector<std::pair<std::string, int>> endpoints;
+        for (size_t i = 0; i < ports.size(); ++i) {
+            endpoints.push_back({host, ports[i]});
         }
-
-        // 初始化 libsodium
-        rbft::crypto::Init();
-
-        // 加载配置
-        auto config = rbft::LoadConfig(config_path);
-
-        // 切换工作目录到项目根目录 (如果从 build/ 运行)
-        // 这样 data/ 和 config/ 的相对路径都能正确解析
-        auto config_abs = std::filesystem::absolute(config_path);
-        auto project_root = config_abs.parent_path().parent_path(); // config/node1.json → project_root
-        if (std::filesystem::exists(project_root / "CMakeLists.txt")) {
-            std::filesystem::current_path(project_root);
-        }
-
-        // 设置日志
-        std::filesystem::create_directories("data/" + config.node_id);
-        rbft::Logger::SetLogFile("data/" + config.node_id + "/cli.log");
 
         PrintBanner();
-        std::cout << "  节点: " << config.node_id << "  端口: " << config.rest_port << "\n";
-        std::cout << "  数据库: " << config.db_path << "\n";
-        std::cout << "  调试日志: data/" << config.node_id << "/cli_debug.log\n";
+        std::cout << "  连接节点:\n";
+        for (size_t i = 0; i < endpoints.size(); ++i) {
+            std::cout << "    node" << (i + 1) << " → " << endpoints[i].first << ":" << endpoints[i].second << "\n";
+        }
         std::cout << "\n";
 
-        // 创建并运行 CLI 会话
-        rbft::CliSession session(config);
+        rbft::CliSession session(endpoints);
         session.Run();
 
         std::cout << "\n\033[33m再见!\033[0m\n";

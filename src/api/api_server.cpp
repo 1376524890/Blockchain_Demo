@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <filesystem>
 #include <sstream>
+#include <thread>
 
 namespace rbft {
 
@@ -195,11 +196,51 @@ void ApiServer::RegisterRoutes(httplib::Server& server) {
         ReplyJson(res, 200, Ok(consensus_.Status()));
     });
 
+    server.Post("/api/crypto/generate-keypair", [this](const httplib::Request&, httplib::Response& res) {
+        auto kp = crypto::GenerateEd25519KeyPair();
+        const std::string address = crypto::Sha256Hex(kp.public_key_hex).substr(0, 40);
+        ReplyJson(res, 200, Ok({{"address", address}, {"public_key", kp.public_key_hex}, {"private_key", kp.private_key_hex}}));
+    });
+
+    server.Post("/api/crypto/encrypt", [this](const httplib::Request& req, httplib::Response& res) {
+        try {
+            auto j = nlohmann::json::parse(req.body);
+            auto plaintext = j.at("plaintext").get<std::string>();
+            auto password = j.at("password").get<std::string>();
+            auto encrypted = crypto::EncryptSecret(plaintext, password);
+            ReplyJson(res, 200, Ok({{"encrypted", encrypted}}));
+        } catch (const std::exception& e) {
+            ReplyJson(res, 400, Err(e.what()));
+        }
+    });
+
+    server.Post("/api/crypto/decrypt", [this](const httplib::Request& req, httplib::Response& res) {
+        try {
+            auto j = nlohmann::json::parse(req.body);
+            auto encrypted = j.at("encrypted").get<std::string>();
+            auto password = j.at("password").get<std::string>();
+            auto plaintext = crypto::DecryptSecret(encrypted, password);
+            ReplyJson(res, 200, Ok({{"plaintext", plaintext}}));
+        } catch (const std::exception& e) {
+            ReplyJson(res, 400, Err(e.what()));
+        }
+    });
+
     server.Post("/api/users/register", [this](const httplib::Request& req, httplib::Response& res) {
         try {
             auto j = nlohmann::json::parse(req.body);
-            auto u = users_.Register(j.at("username").get<std::string>(), j.at("password").get<std::string>());
-            // private_key 仅为演示返回，真实系统应由客户端 keystore 保存。
+            auto username = j.at("username").get<std::string>();
+            auto password = j.at("password").get<std::string>();
+            UserRecord u;
+            // 如果客户端提供了 address/public_key/private_key，直接使用（多节点同步）
+            if (j.contains("address") && j.contains("public_key") && j.contains("private_key")) {
+                u = users_.RegisterWithKey(username, password,
+                    j.at("address").get<std::string>(),
+                    j.at("public_key").get<std::string>(),
+                    j.at("private_key").get<std::string>());
+            } else {
+                u = users_.Register(username, password);
+            }
             ReplyJson(res, 200, Ok({{"user_id", u.user_id}, {"username", u.username}, {"address", u.address},
                                    {"public_key", u.public_key_hex}, {"private_key", u.private_key_hex}}));
         } catch (const std::exception& e) {
@@ -216,6 +257,42 @@ void ApiServer::RegisterRoutes(httplib::Server& server) {
         } catch (const std::exception& e) {
             ReplyJson(res, 401, Err(e.what()));
         }
+    });
+
+    server.Get("/api/users", [this](const httplib::Request& req, httplib::Response& res) {
+        size_t page = 1, page_size = 10;
+        if (req.has_param("page")) page = std::max(1, std::stoi(req.get_param_value("page")));
+        if (req.has_param("page_size")) page_size = std::clamp(std::stoi(req.get_param_value("page_size")), 1, 100);
+        size_t offset = (page - 1) * page_size;
+
+        sqlite3_stmt* count_stmt = nullptr;
+        sqlite3_prepare_v2(storage_.Raw(), "SELECT COUNT(*) FROM users;", -1, &count_stmt, nullptr);
+        sqlite3_step(count_stmt);
+        int total = static_cast<int>(sqlite3_column_int64(count_stmt, 0));
+        sqlite3_finalize(count_stmt);
+
+        sqlite3_stmt* stmt = nullptr;
+        sqlite3_prepare_v2(storage_.Raw(),
+            "SELECT u.user_id, u.username, u.address, COALESCE(a.balance, 0), COALESCE(a.nonce, 0) "
+            "FROM users u LEFT JOIN accounts a ON u.address = a.address "
+            "ORDER BY u.user_id LIMIT ? OFFSET ?;",
+            -1, &stmt, nullptr);
+        sqlite3_bind_int64(stmt, 1, static_cast<sqlite3_int64>(page_size));
+        sqlite3_bind_int64(stmt, 2, static_cast<sqlite3_int64>(offset));
+
+        nlohmann::json users = nlohmann::json::array();
+        while (sqlite3_step(stmt) == SQLITE_ROW) {
+            users.push_back({
+                {"user_id", sqlite3_column_int64(stmt, 0)},
+                {"username", reinterpret_cast<const char*>(sqlite3_column_text(stmt, 1))},
+                {"address", reinterpret_cast<const char*>(sqlite3_column_text(stmt, 2))},
+                {"balance", static_cast<uint64_t>(sqlite3_column_int64(stmt, 3))},
+                {"nonce", static_cast<uint64_t>(sqlite3_column_int64(stmt, 4))}
+            });
+        }
+        sqlite3_finalize(stmt);
+
+        ReplyJson(res, 200, Ok({{"users", users}, {"total", total}, {"page", page}, {"page_size", page_size}}));
     });
 
     server.Get(R"(/api/users/([0-9a-fA-F]+))", [this](const httplib::Request& req, httplib::Response& res) {
@@ -305,6 +382,8 @@ void ApiServer::RegisterRoutes(httplib::Server& server) {
                 consensus_.AddEvent({0, 0, "", block.header.height, block.header.view, block.header.instance_id,
                                      "AUTO_COMMIT_BLOCK", config_.node_id, config_.node_id, block.header.block_hash, true, "", ""});
                 mempool_.RemoveCommitted(picked);
+                // P2P 同步: 异步广播区块到其他节点
+                BroadcastBlock(block);
                 ReplyJson(res, 200, Ok({{"tx_id", tx.tx_id}, {"status", "COMMITTED"}, {"block_height", block.header.height}}));
                 return;
             }
@@ -623,6 +702,44 @@ void ApiServer::RegisterRoutes(httplib::Server& server) {
     server.Get("/p2p/status", [this](const httplib::Request&, httplib::Response& res) {
         ReplyJson(res, 200, Ok(consensus_.Status()));
     });
+
+    // 接收其他节点同步的区块
+    server.Post("/p2p/sync/block", [this](const httplib::Request& req, httplib::Response& res) {
+        try {
+            auto j = nlohmann::json::parse(req.body);
+            Block block = BlockFromJson(j);
+
+            // 检查高度是否连续
+            uint64_t local_height = std::stoull(storage_.GetMetadata("latest_height", "0"));
+            if (block.header.height <= local_height) {
+                // 已有该区块, 忽略
+                ReplyJson(res, 200, Ok({{"status", "IGNORED"}, {"reason", "already have height " + std::to_string(block.header.height)}}));
+                return;
+            }
+            if (block.header.height > local_height + 1) {
+                ReplyJson(res, 400, Err("height gap: expected " + std::to_string(local_height + 1) + " got " + std::to_string(block.header.height)));
+                return;
+            }
+
+            // 验证前一区块哈希
+            auto prev = storage_.GetLatestBlock();
+            std::string expected_prev = prev ? prev->header.block_hash : std::string(64, '0');
+            if (block.header.previous_block_hash != expected_prev) {
+                ReplyJson(res, 400, Err("previous_block_hash mismatch"));
+                return;
+            }
+
+            // 提交区块
+            executor_.CommitBlock(block);
+            mempool_.RemoveCommitted(block.transactions);
+            Logger::Info("synced block #" + std::to_string(block.header.height) + " from " + block.header.proposer_id);
+            consensus_.AddEvent({0, 0, "", block.header.height, block.header.view, block.header.instance_id,
+                                 "SYNC_BLOCK", block.header.proposer_id, config_.node_id, block.header.block_hash, true, "", ""});
+            ReplyJson(res, 200, Ok({{"status", "SYNCED"}, {"height", block.header.height}}));
+        } catch (const std::exception& e) {
+            ReplyJson(res, 400, Err(e.what()));
+        }
+    });
 }
 
 void ApiServer::Run() {
@@ -631,6 +748,28 @@ void ApiServer::Run() {
     Logger::Info("listening REST/P2P on port " + std::to_string(config_.rest_port));
     // 演示实现先复用一个 httplib 端口承载 REST 与 P2P 路由；配置仍保留 p2p_port，后续可拆成双 server。
     server.listen("0.0.0.0", config_.rest_port);
+}
+
+void ApiServer::BroadcastBlock(const Block& block) {
+    // 异步广播区块到所有 peer 节点
+    auto block_json = BlockToJson(block).dump();
+    for (const auto& peer : config_.peers) {
+        std::thread([peer, block_json]() {
+            try {
+                httplib::Client client(peer.host, peer.rest_port);
+                client.set_connection_timeout(3);
+                client.set_read_timeout(5);
+                auto res = client.Post("/p2p/sync/block", block_json, "application/json");
+                if (res && res->status == 200) {
+                    Logger::Info("synced block to " + peer.node_id);
+                } else {
+                    Logger::Warn("sync to " + peer.node_id + " failed: " + (res ? std::to_string(res->status) : "no response"));
+                }
+            } catch (const std::exception& e) {
+                Logger::Warn("sync to " + peer.node_id + " exception: " + e.what());
+            }
+        }).detach();
+    }
 }
 
 } // namespace rbft

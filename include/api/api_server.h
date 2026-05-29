@@ -23,6 +23,7 @@ private:
     nlohmann::json Err(const std::string& error) const;
     void RegisterRoutes(httplib::Server& server);
     void ReplyJson(httplib::Response& res, int status, const nlohmann::json& body) const;
+    void BroadcastBlock(const Block& block);
 
     NodeConfig config_;
     SQLiteStorage storage_;
