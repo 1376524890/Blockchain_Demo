@@ -23,4 +23,10 @@ std::string PasswordHash(const std::string& password);
 bool PasswordVerify(const std::string& hash, const std::string& password);
 std::string RandomTokenHex(size_t bytes = 32);
 
+// ── 对称加密 (密码派生密钥 + XSalsa20-Poly1305) ──
+// 返回 salt(16B) + nonce(24B) + ciphertext + tag 的 hex 编码
+std::string EncryptSecret(const std::string& plaintext, const std::string& password);
+// 解密，密码错误抛异常
+std::string DecryptSecret(const std::string& encrypted_hex, const std::string& password);
+
 } // namespace rbft::crypto

@@ -17,6 +17,28 @@ export default defineConfig({
     }
   },
   server: {
-    port: 5173
+    port: 5173,
+    proxy: {
+      '/node-api/node1': {
+        target: 'http://localhost:8001',
+        changeOrigin: true,
+        rewrite: (path) => path.replace(/^\/node-api\/node1/, '')
+      },
+      '/node-api/node2': {
+        target: 'http://localhost:8002',
+        changeOrigin: true,
+        rewrite: (path) => path.replace(/^\/node-api\/node2/, '')
+      },
+      '/node-api/node3': {
+        target: 'http://localhost:8003',
+        changeOrigin: true,
+        rewrite: (path) => path.replace(/^\/node-api\/node3/, '')
+      },
+      '/node-api/node4': {
+        target: 'http://localhost:8004',
+        changeOrigin: true,
+        rewrite: (path) => path.replace(/^\/node-api\/node4/, '')
+      }
+    }
   }
 })

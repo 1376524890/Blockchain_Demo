@@ -3,10 +3,10 @@ import type { ApiResponse, NodeEndpoint } from '@/types/api'
 import { useDebugStore } from '@/stores/debugStore'
 
 export const NODE_ENDPOINTS: NodeEndpoint[] = [
-  { id: 'node1', baseURL: 'http://127.0.0.1:8001' },
-  { id: 'node2', baseURL: 'http://127.0.0.1:8002' },
-  { id: 'node3', baseURL: 'http://127.0.0.1:8003' },
-  { id: 'node4', baseURL: 'http://127.0.0.1:8004' }
+  { id: 'node1', baseURL: '/node-api/node1' },
+  { id: 'node2', baseURL: '/node-api/node2' },
+  { id: 'node3', baseURL: '/node-api/node3' },
+  { id: 'node4', baseURL: '/node-api/node4' }
 ]
 
 export async function request<T>(

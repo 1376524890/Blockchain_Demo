@@ -11,16 +11,21 @@ namespace rbft {
 UserManager::UserManager(SQLiteStorage* storage) : storage_(storage) {}
 
 UserRecord UserManager::Register(const std::string& username, const std::string& password) {
-    if (username.size() < 3 || password.size() < 6) {
-        throw std::invalid_argument("username or password too short");
+    if (username.size() < 3) {
+        throw std::invalid_argument("用户名至少需要 3 个字符 (当前: " + std::to_string(username.size()) + ")");
+    }
+    if (password.size() < 6) {
+        throw std::invalid_argument("密码至少需要 6 个字符 (当前: " + std::to_string(password.size()) + ")");
     }
     if (username_index_.Contains(username)) {
-        throw std::runtime_error("username exists");
+        throw std::runtime_error("用户名 \"" + username + "\" 已存在");
     }
 
     auto kp = crypto::GenerateEd25519KeyPair();
     const std::string address = crypto::Sha256Hex(kp.public_key_hex).substr(0, 40);
     const std::string password_hash = crypto::PasswordHash(password);
+    // 用密码派生密钥加密私钥 (XSalsa20-Poly1305, 密钥由 Argon2id 从密码派生)
+    const std::string encrypted_pk = crypto::EncryptSecret(kp.private_key_hex, password);
     const uint64_t now = NowMillis();
 
     // 用户注册必须在一个事务内同时写 users 与初始 accounts，避免索引和账户状态不一致。
@@ -33,11 +38,11 @@ UserRecord UserManager::Register(const std::string& username, const std::string&
         sqlite3_bind_text(stmt, 2, password_hash.c_str(), -1, SQLITE_TRANSIENT);
         sqlite3_bind_text(stmt, 3, address.c_str(), -1, SQLITE_TRANSIENT);
         sqlite3_bind_text(stmt, 4, kp.public_key_hex.c_str(), -1, SQLITE_TRANSIENT);
-        sqlite3_bind_text(stmt, 5, kp.private_key_hex.c_str(), -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text(stmt, 5, encrypted_pk.c_str(), -1, SQLITE_TRANSIENT);
         sqlite3_bind_int64(stmt, 6, static_cast<sqlite3_int64>(now));
         if (sqlite3_step(stmt) != SQLITE_DONE) {
             sqlite3_finalize(stmt);
-            throw std::runtime_error("insert user failed");
+            throw std::runtime_error("用户名 \"" + username + "\" 已存在");
         }
         int64_t user_id = sqlite3_last_insert_rowid(storage_->Raw());
         sqlite3_finalize(stmt);
@@ -58,18 +63,25 @@ LoginResult UserManager::Login(const std::string& username, const std::string& p
     sqlite3_bind_text(stmt, 1, username.c_str(), -1, SQLITE_TRANSIENT);
     if (sqlite3_step(stmt) != SQLITE_ROW) {
         sqlite3_finalize(stmt);
-        throw std::runtime_error("invalid credential");
+        throw std::runtime_error("用户 \"" + username + "\" 不存在，请先注册");
     }
     const int64_t user_id = sqlite3_column_int64(stmt, 0);
     const std::string password_hash = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 1));
-    UserRecord user{user_id, username,
-                    reinterpret_cast<const char*>(sqlite3_column_text(stmt, 2)),
-                    reinterpret_cast<const char*>(sqlite3_column_text(stmt, 3)),
-                    reinterpret_cast<const char*>(sqlite3_column_text(stmt, 4))};
+    const std::string address = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 2));
+    const std::string pub_key = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 3));
+    const std::string encrypted_pk = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 4));
     sqlite3_finalize(stmt);
     if (!crypto::PasswordVerify(password_hash, password)) {
-        throw std::runtime_error("invalid credential");
+        throw std::runtime_error("密码错误");
     }
+    // 密码验证通过, 用密码派生密钥解密私钥
+    std::string private_key_hex;
+    try {
+        private_key_hex = crypto::DecryptSecret(encrypted_pk, password);
+    } catch (const std::exception& e) {
+        throw std::runtime_error(std::string("私钥解密失败: ") + e.what());
+    }
+    UserRecord user{user_id, username, address, pub_key, private_key_hex};
     const std::string token = crypto::RandomTokenHex();
     const uint64_t now = NowMillis();
     sqlite3_prepare_v2(storage_->Raw(), "INSERT OR REPLACE INTO sessions(token,user_id,created_at,expires_at) VALUES(?,?,?,?);", -1, &stmt, nullptr);

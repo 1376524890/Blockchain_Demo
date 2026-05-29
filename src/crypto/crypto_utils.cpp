@@ -83,4 +83,63 @@ std::string RandomTokenHex(size_t bytes) {
     return BytesToHex(buf.data(), buf.size());
 }
 
+// ── 对称加密: 密码派生密钥 + XSalsa20-Poly1305 ──
+
+static std::array<unsigned char, crypto_secretbox_KEYBYTES>
+DeriveKey(const std::string& password, const unsigned char* salt) {
+    std::array<unsigned char, crypto_secretbox_KEYBYTES> key{};
+    if (crypto_pwhash(key.data(), key.size(), password.c_str(), password.size(),
+                      salt, crypto_pwhash_OPSLIMIT_INTERACTIVE,
+                      crypto_pwhash_MEMLIMIT_INTERACTIVE, crypto_pwhash_ALG_ARGON2ID13) != 0) {
+        throw std::runtime_error("密钥派生失败 (内存不足)");
+    }
+    return key;
+}
+
+std::string EncryptSecret(const std::string& plaintext, const std::string& password) {
+    Init();
+    // 1. 随机 salt + nonce
+    unsigned char salt[crypto_pwhash_SALTBYTES];
+    randombytes_buf(salt, sizeof(salt));
+    unsigned char nonce[crypto_secretbox_NONCEBYTES];
+    randombytes_buf(nonce, sizeof(nonce));
+    // 2. 派生密钥
+    auto key = DeriveKey(password, salt);
+    // 3. 加密 (密文 = 明文 + MAC tag)
+    std::vector<unsigned char> ciphertext(plaintext.size() + crypto_secretbox_MACBYTES);
+    crypto_secretbox_easy(ciphertext.data(),
+                          reinterpret_cast<const unsigned char*>(plaintext.data()),
+                          plaintext.size(), nonce, key.data());
+    // 4. 拼接: salt(16) + nonce(24) + ciphertext+tag
+    std::vector<unsigned char> packed;
+    packed.insert(packed.end(), salt, salt + sizeof(salt));
+    packed.insert(packed.end(), nonce, nonce + sizeof(nonce));
+    packed.insert(packed.end(), ciphertext.begin(), ciphertext.end());
+    sodium_memzero(key.data(), key.size());
+    return BytesToHex(packed.data(), packed.size());
+}
+
+std::string DecryptSecret(const std::string& encrypted_hex, const std::string& password) {
+    Init();
+    auto packed = HexToBytes(encrypted_hex);
+    const size_t header = crypto_pwhash_SALTBYTES + crypto_secretbox_NONCEBYTES;
+    if (packed.size() < header + crypto_secretbox_MACBYTES) {
+        throw std::runtime_error("加密数据格式错误");
+    }
+    const unsigned char* salt = packed.data();
+    const unsigned char* nonce = packed.data() + crypto_pwhash_SALTBYTES;
+    const unsigned char* ct = packed.data() + header;
+    const size_t ct_len = packed.size() - header;
+    // 派生密钥
+    auto key = DeriveKey(password, salt);
+    // 解密
+    std::vector<unsigned char> plaintext(ct_len - crypto_secretbox_MACBYTES);
+    if (crypto_secretbox_open_easy(plaintext.data(), ct, ct_len, nonce, key.data()) != 0) {
+        sodium_memzero(key.data(), key.size());
+        throw std::runtime_error("解密失败: 密码错误或数据被篡改");
+    }
+    sodium_memzero(key.data(), key.size());
+    return std::string(plaintext.begin(), plaintext.end());
+}
+
 } // namespace rbft::crypto

@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 cd "$(dirname "$0")/.."
-BASE_URL="${BASE_URL:-http://127.0.0.1:8001}" python3 - <<'PY'
+BASE_URL="${BASE_URL:-http://localhost:8001}" python3 - <<'PY'
 import os, time, requests
 
 base = os.environ["BASE_URL"]

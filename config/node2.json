@@ -11,8 +11,8 @@
   "block_interval_ms": 1500,
   "consensus_timeout_ms": 5000,
   "peers": [
-    {"node_id": "node1", "host": "127.0.0.1", "rest_port": 8001, "p2p_port": 9001, "public_key": ""},
-    {"node_id": "node3", "host": "127.0.0.1", "rest_port": 8003, "p2p_port": 9003, "public_key": ""},
-    {"node_id": "node4", "host": "127.0.0.1", "rest_port": 8004, "p2p_port": 9004, "public_key": ""}
+    {"node_id": "node1", "host": "localhost", "rest_port": 8001, "p2p_port": 9001, "public_key": ""},
+    {"node_id": "node3", "host": "localhost", "rest_port": 8003, "p2p_port": 9003, "public_key": ""},
+    {"node_id": "node4", "host": "localhost", "rest_port": 8004, "p2p_port": 9004, "public_key": ""}
   ]
 }

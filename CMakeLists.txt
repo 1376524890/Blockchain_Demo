@@ -25,6 +25,7 @@ FetchContent_MakeAvailable(json httplib googletest)
 
 file(GLOB_RECURSE RBFT_SOURCES CONFIGURE_DEPENDS src/*.cpp)
 list(FILTER RBFT_SOURCES EXCLUDE REGEX ".*/main\\.cpp$")
+list(FILTER RBFT_SOURCES EXCLUDE REGEX ".*/main_cli\\.cpp$")
 
 add_library(rbft_core ${RBFT_SOURCES})
 target_include_directories(rbft_core PUBLIC include ${SODIUM_INCLUDE_DIRS} ${SQLITE3_INCLUDE_DIRS})
@@ -36,6 +37,9 @@ target_compile_options(rbft_core PRIVATE
 
 add_executable(rbft_node src/main.cpp)
 target_link_libraries(rbft_node PRIVATE rbft_core)
+
+add_executable(rbft_cli src/cli/main_cli.cpp)
+target_link_libraries(rbft_cli PRIVATE rbft_core)
 
 enable_testing()
 file(GLOB UNIT_TESTS CONFIGURE_DEPENDS tests/unit/*.cpp)

@@ -4,10 +4,10 @@
 
 The demo frontend uses REST/P2P routes on the REST ports only:
 
-- node1: `http://127.0.0.1:8001`
-- node2: `http://127.0.0.1:8002`
-- node3: `http://127.0.0.1:8003`
-- node4: `http://127.0.0.1:8004`
+- node1: `http://localhost:8001`
+- node2: `http://localhost:8002`
+- node3: `http://localhost:8003`
+- node4: `http://localhost:8004`
 
 New visualization endpoints:
 

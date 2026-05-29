@@ -30,7 +30,7 @@ NodeConfig LoadConfig(const std::string& path) {
     for (const auto& p : j.at("peers")) {
         cfg.peers.push_back(PeerConfig{
             p.at("node_id").get<std::string>(),
-            p.value("host", "127.0.0.1"),
+            p.value("host", "localhost"),
             p.at("rest_port").get<int>(),
             p.at("p2p_port").get<int>(),
             p.value("public_key", "")
