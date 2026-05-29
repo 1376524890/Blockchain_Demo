@@ -362,7 +362,7 @@ void ApiServer::RegisterRoutes(httplib::Server& server) {
             }
             consensus_.AddEvent({0, 0, "", 0, 0, 0, "MEMPOOL_ADD", tx.from, config_.node_id, tx.tx_id, true, "", ""});
             storage_.PutTransaction(tx, "PENDING", std::nullopt, std::nullopt);
-            if (consensus_.IsRunning() && consensus_.GetAttackMode() == AttackMode::NORMAL) {
+            if (consensus_.IsRunning()) {
                 auto picked = mempool_.PickTransactions(100);
                 Block block;
                 block.transactions = picked;
@@ -377,12 +377,28 @@ void ApiServer::RegisterRoutes(httplib::Server& server) {
                 block.header.instance_id = 0;
                 block.header.proposer_id = config_.node_id;
                 block.header.block_hash = ComputeBlockHash(block.header);
-                // 演示模式下本地自动提交区块；完整 RBFT 网络投票逻辑由 ConsensusEngine/P2P 接口承载。
+
+                // 攻击模式: 篡改区块数据
+                auto mode = consensus_.GetAttackMode();
+                if (mode == AttackMode::BAD_MERKLE_ROOT) {
+                    block.header.tx_merkle_root = std::string(64, '0');
+                    Logger::Warn("attack: tampered merkle root on block #" + std::to_string(block.header.height));
+                } else if (mode == AttackMode::BAD_STATE_ROOT) {
+                    block.header.state_root = std::string(64, '0');
+                    Logger::Warn("attack: tampered state root on block #" + std::to_string(block.header.height));
+                } else if (mode == AttackMode::INVALID_BLOCK_HASH) {
+                    block.header.block_hash = std::string(64, '0');
+                    Logger::Warn("attack: tampered block hash on block #" + std::to_string(block.header.height));
+                }
+
+                // 本地提交 (恶意节点本地接受篡改的区块)
                 executor_.CommitBlock(block);
                 consensus_.AddEvent({0, 0, "", block.header.height, block.header.view, block.header.instance_id,
-                                     "AUTO_COMMIT_BLOCK", config_.node_id, config_.node_id, block.header.block_hash, true, "", ""});
+                                     mode == AttackMode::NORMAL ? "AUTO_COMMIT_BLOCK" : "ATTACK_COMMIT",
+                                     config_.node_id, config_.node_id, block.header.block_hash,
+                                     mode == AttackMode::NORMAL, "", AttackModeToString(mode)});
                 mempool_.RemoveCommitted(picked);
-                // P2P 同步: 异步广播区块到其他节点
+                // P2P 广播 (诚实节点会验证并拒绝篡改的区块)
                 BroadcastBlock(block);
                 ReplyJson(res, 200, Ok({{"tx_id", tx.tx_id}, {"status", "COMMITTED"}, {"block_height", block.header.height}}));
                 return;
@@ -729,7 +745,33 @@ void ApiServer::RegisterRoutes(httplib::Server& server) {
                 return;
             }
 
-            // 提交区块
+            // 验证 Merkle 根
+            std::string real_merkle = HashToHex(MerkleTree::ComputeRoot(block.transactions));
+            if (real_merkle != block.header.tx_merkle_root) {
+                Logger::Warn("sync block #" + std::to_string(block.header.height) + " rejected: merkle root mismatch");
+                ReplyJson(res, 403, Err("merkle root mismatch: expected " + real_merkle));
+                return;
+            }
+
+            // 验证 state_root
+            std::string real_state = executor_.ExecuteForStateRoot(block.transactions);
+            if (real_state != block.header.state_root) {
+                Logger::Warn("sync block #" + std::to_string(block.header.height) + " rejected: state root mismatch");
+                ReplyJson(res, 403, Err("state root mismatch: expected " + real_state));
+                return;
+            }
+
+            // 验证 block_hash
+            BlockHeader hdr = block.header;
+            std::string saved_hash = hdr.block_hash;
+            hdr.block_hash = "";
+            if (ComputeBlockHash(hdr) != saved_hash) {
+                Logger::Warn("sync block #" + std::to_string(block.header.height) + " rejected: block hash mismatch");
+                ReplyJson(res, 403, Err("block hash mismatch"));
+                return;
+            }
+
+            // 全部验证通过，提交区块
             executor_.CommitBlock(block);
             mempool_.RemoveCommitted(block.transactions);
             Logger::Info("synced block #" + std::to_string(block.header.height) + " from " + block.header.proposer_id);
