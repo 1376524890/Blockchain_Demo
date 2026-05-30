@@ -1327,8 +1327,8 @@ void ApiServer::TryProposeBlock() {
         block.header.height = std::stoull(storage_.GetMetadata("latest_height", "0")) + 1;
         auto latest = storage_.GetLatestBlock();
         block.header.previous_block_hash = latest ? latest->header.block_hash : std::string(64, '0');
-        block.header.tx_merkle_root = HashToHex(MerkleTree::ComputeRoot(picked));
-        block.header.state_root = executor_.ExecuteForStateRoot(picked);
+        block.header.tx_merkle_root = HashToHex(MerkleTree::ComputeRoot(valid_txs));
+        block.header.state_root = executor_.ExecuteForStateRoot(valid_txs);
         block.header.timestamp = NowMillis();
         block.header.view = consensus_.CurrentView();
         block.header.instance_id = 0;

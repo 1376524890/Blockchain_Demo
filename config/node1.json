@@ -4,7 +4,7 @@
   "p2p_port": 9001,
   "db_path": "data/node1/chain.db",
   "node_private_key_path": "data/node1/node.key",
-  "node_public_key": "7cb758ab0bd3afdd922a36ff156e52e33d1f83ab9823a077b76a1ee12e4e93cb",
+  "node_public_key": "d68f05c2b199a82392ba0f78159441ede07669cfbf2cad2ad4a0921338ab6e88",
   "chain_id": "rbft-demo-chain",
   "f": 1,
   "instance_count": 2,
@@ -16,21 +16,21 @@
       "host": "localhost",
       "rest_port": 8002,
       "p2p_port": 9002,
-      "public_key": "49a4450175f838d8dda8a6c645eeb82cfe525ffd3d92b62999514f72c5fdd727"
+      "public_key": "d0fc78e018f7935a79a7f101f2d53d6497021da9509bc0729ae20bc2c647776b"
     },
     {
       "node_id": "node3",
       "host": "localhost",
       "rest_port": 8003,
       "p2p_port": 9003,
-      "public_key": "3994f4f7e7c38e51a04910ecac21d1fa550df5c2de16d6c6f2ca80b866eb464c"
+      "public_key": "9ec1da9ebb33db3cd3ce1992b143346262e92e024f541775074f940cc85783fd"
     },
     {
       "node_id": "node4",
       "host": "localhost",
       "rest_port": 8004,
       "p2p_port": 9004,
-      "public_key": "44ccfe9238e811d1313bcabd54fb39c1415dda43be437eaccf0fd67ef817e1f9"
+      "public_key": "ec36891baeb657593ee28c71db51ee7f5503456485e9c987d1af81e20f250b8b"
     }
   ]
 }
