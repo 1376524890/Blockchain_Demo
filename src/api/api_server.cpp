@@ -4,7 +4,9 @@
 #include "crypto/crypto_utils.h"
 
 #include <algorithm>
+#include <chrono>
 #include <filesystem>
+#include <future>
 #include <sstream>
 #include <thread>
 
@@ -106,11 +108,21 @@ nlohmann::json TransactionSummaryJson(const Transaction& tx) {
 ApiServer::ApiServer(NodeConfig config)
     : config_(std::move(config)),
       users_(&storage_),
-      consensus_(config_),
+      consensus_(config_, &storage_),
       executor_(&storage_) {
     std::filesystem::create_directories(std::filesystem::path(config_.db_path).parent_path());
     storage_.Open(config_.db_path);
     storage_.InitializeSchema();
+    consensus_.LoadQuarantineFromStorage(&storage_);
+    // 启动 PBFT 共识定时器
+    consensus_timer_thread_ = std::thread([this]() { ConsensusTimerLoop(); });
+}
+
+ApiServer::~ApiServer() {
+    stop_timer_ = true;
+    if (consensus_timer_thread_.joinable()) {
+        consensus_timer_thread_.join();
+    }
 }
 
 void ApiServer::InitDbOnly() {
@@ -194,6 +206,40 @@ void ApiServer::RegisterRoutes(httplib::Server& server) {
     server.Post("/api/admin/start-consensus", [this](const httplib::Request&, httplib::Response& res) {
         consensus_.Start();
         ReplyJson(res, 200, Ok(consensus_.Status()));
+    });
+
+    // ── 隔离管理端点 ──
+    server.Post("/api/admin/quarantine", [this](const httplib::Request& req, httplib::Response& res) {
+        try {
+            auto j = nlohmann::json::parse(req.body);
+            auto node_id = j.at("node_id").get<std::string>();
+            auto reason = j.value("reason", "manual quarantine");
+            consensus_.QuarantineNode(node_id, reason);
+            ReplyJson(res, 200, Ok({{"quarantined", node_id}, {"reason", reason}}));
+        } catch (const std::exception& e) {
+            ReplyJson(res, 400, Err(e.what()));
+        }
+    });
+
+    server.Post("/api/admin/unquarantine", [this](const httplib::Request& req, httplib::Response& res) {
+        try {
+            auto j = nlohmann::json::parse(req.body);
+            auto node_id = j.at("node_id").get<std::string>();
+            consensus_.UnquarantineNode(node_id);
+            ReplyJson(res, 200, Ok({{"unquarantined", node_id}}));
+        } catch (const std::exception& e) {
+            ReplyJson(res, 400, Err(e.what()));
+        }
+    });
+
+    server.Get("/api/admin/quarantine", [this](const httplib::Request&, httplib::Response& res) {
+        auto nodes = consensus_.QuarantinedNodes();
+        nlohmann::json arr = nlohmann::json::array();
+        for (const auto& nid : nodes) {
+            auto reason = storage_.GetMetadata("quarantine:" + nid, "");
+            arr.push_back({{"node_id", nid}, {"reason", reason}});
+        }
+        ReplyJson(res, 200, Ok({{"quarantined_nodes", arr}}));
     });
 
     server.Post("/api/crypto/generate-keypair", [this](const httplib::Request&, httplib::Response& res) {
@@ -349,7 +395,6 @@ void ApiServer::RegisterRoutes(httplib::Server& server) {
             if (j.contains("signature")) {
                 tx.signature_hex = j.at("signature").get<std::string>();
             } else if (j.contains("private_key")) {
-                // demo-only：便于脚本演示，真实系统必须由客户端本地签名。
                 tx.signature_hex = crypto::SignDetachedHex(SerializeTransactionBody(tx), j.at("private_key").get<std::string>());
             } else {
                 throw std::runtime_error("missing signature");
@@ -362,46 +407,29 @@ void ApiServer::RegisterRoutes(httplib::Server& server) {
             }
             consensus_.AddEvent({0, 0, "", 0, 0, 0, "MEMPOOL_ADD", tx.from, config_.node_id, tx.tx_id, true, "", ""});
             storage_.PutTransaction(tx, "PENDING", std::nullopt, std::nullopt);
-            if (consensus_.IsRunning()) {
-                auto picked = mempool_.PickTransactions(100);
-                Block block;
-                block.transactions = picked;
-                block.header.chain_id = config_.chain_id;
-                block.header.height = std::stoull(storage_.GetMetadata("latest_height", "0")) + 1;
-                auto latest = storage_.GetLatestBlock();
-                block.header.previous_block_hash = latest ? latest->header.block_hash : std::string(64, '0');
-                block.header.tx_merkle_root = HashToHex(MerkleTree::ComputeRoot(picked));
-                block.header.state_root = executor_.ExecuteForStateRoot(picked);
-                block.header.timestamp = NowMillis();
-                block.header.view = 0;
-                block.header.instance_id = 0;
-                block.header.proposer_id = config_.node_id;
-                block.header.block_hash = ComputeBlockHash(block.header);
 
-                // 攻击模式: 篡改区块数据
-                auto mode = consensus_.GetAttackMode();
-                if (mode == AttackMode::BAD_MERKLE_ROOT) {
-                    block.header.tx_merkle_root = std::string(64, '0');
-                    Logger::Warn("attack: tampered merkle root on block #" + std::to_string(block.header.height));
-                } else if (mode == AttackMode::BAD_STATE_ROOT) {
-                    block.header.state_root = std::string(64, '0');
-                    Logger::Warn("attack: tampered state root on block #" + std::to_string(block.header.height));
-                } else if (mode == AttackMode::INVALID_BLOCK_HASH) {
-                    block.header.block_hash = std::string(64, '0');
-                    Logger::Warn("attack: tampered block hash on block #" + std::to_string(block.header.height));
+            // PBFT 模式：交易加入本地 mempool
+            // 如果当前节点不是 Primary，异步转发给 Primary
+            // Primary 的定时器会从 mempool 出块
+            if (consensus_.IsRunning() && !consensus_.IsPrimary()) {
+                std::string primary_id = consensus_.Primary(consensus_.CurrentView(), 0);
+                for (const auto& peer : config_.peers) {
+                    if (peer.node_id == primary_id) {
+                        auto tx_json = req.body;
+                        auto p = peer;
+                        auto t = type;
+                        std::thread([p, tx_json, t]() {
+                            try {
+                                httplib::Client client(p.host, p.rest_port);
+                                client.set_connection_timeout(1);
+                                client.set_read_timeout(2);
+                                std::string path = (t == "TRANSFER") ? "/api/transactions/transfer" : "/api/transactions/store";
+                                client.Post(path, tx_json, "application/json");
+                            } catch (...) {}
+                        }).detach();
+                        break;
+                    }
                 }
-
-                // 本地提交 (恶意节点本地接受篡改的区块)
-                executor_.CommitBlock(block);
-                consensus_.AddEvent({0, 0, "", block.header.height, block.header.view, block.header.instance_id,
-                                     mode == AttackMode::NORMAL ? "AUTO_COMMIT_BLOCK" : "ATTACK_COMMIT",
-                                     config_.node_id, config_.node_id, block.header.block_hash,
-                                     mode == AttackMode::NORMAL, "", AttackModeToString(mode)});
-                mempool_.RemoveCommitted(picked);
-                // P2P 广播 (诚实节点会验证并拒绝篡改的区块)
-                BroadcastBlock(block);
-                ReplyJson(res, 200, Ok({{"tx_id", tx.tx_id}, {"status", "COMMITTED"}, {"block_height", block.header.height}}));
-                return;
             }
             ReplyJson(res, 200, Ok({{"tx_id", tx.tx_id}, {"status", "PENDING"}}));
         } catch (const std::exception& e) {
@@ -701,15 +729,109 @@ void ApiServer::RegisterRoutes(httplib::Server& server) {
     server.Post("/p2p/consensus/message", [this](const httplib::Request& req, httplib::Response& res) {
         try {
             auto msg = ConsensusMessageFromJson(nlohmann::json::parse(req.body));
-            consensus_.AddEvent({0, 0, "", msg.height, msg.view, msg.instance_id, "P2P_MESSAGE_RECEIVED",
+            consensus_.AddEvent({0, 0, "", msg.height, msg.view, msg.instance_id, "P2P_" + msg.type,
                                  msg.sender_id, config_.node_id, msg.block_hash, true, "", ""});
-            std::string evidence;
-            bool accepted = consensus_.RecordVote(msg, evidence);
-            if (!accepted) {
-                consensus_.AddEvent({0, 0, "", msg.height, msg.view, msg.instance_id, "RECORD_VOTE_REJECTED",
-                                     msg.sender_id, config_.node_id, msg.block_hash, false, evidence, ""});
+
+            if (msg.type == "PRE_PREPARE") {
+                // ── 收到 PRE_PREPARE（来自 Primary） ──
+                Block block;
+                if (!consensus_.OnPrePrepare(msg, block)) {
+                    ReplyJson(res, 400, Err("PRE_PREPARE rejected"));
+                    return;
+                }
+                // 验证区块完整性
+                std::string real_merkle = HashToHex(MerkleTree::ComputeRoot(block.transactions));
+                if (real_merkle != block.header.tx_merkle_root) {
+                    Logger::Warn("PRE_PREPARE rejected: merkle mismatch");
+                    consensus_.QuarantineNode(msg.sender_id, "PRE_PREPARE merkle mismatch");
+                    consensus_.ResetRound();  // 重置轮次，防止新 Primary 无法出块
+                    ReplyJson(res, 403, Err("merkle mismatch"));
+                    return;
+                }
+                try {
+                    std::string real_state = executor_.ExecuteForStateRoot(block.transactions);
+                    if (real_state != block.header.state_root) {
+                        Logger::Warn("PRE_PREPARE rejected: state_root mismatch");
+                        consensus_.QuarantineNode(msg.sender_id, "PRE_PREPARE state_root mismatch");
+                        consensus_.ResetRound();
+                        ReplyJson(res, 403, Err("state_root mismatch"));
+                        return;
+                    }
+                } catch (const std::exception& e) {
+                    Logger::Warn("PRE_PREPARE rejected: state_root execution failed: " + std::string(e.what()));
+                    consensus_.ResetRound();
+                    ReplyJson(res, 403, Err("state_root execution failed: " + std::string(e.what())));
+                    return;
+                }
+                BlockHeader hdr = block.header;
+                std::string saved_hash = hdr.block_hash;
+                hdr.block_hash = "";
+                if (ComputeBlockHash(hdr) != saved_hash) {
+                    Logger::Warn("PRE_PREPARE rejected: block_hash mismatch");
+                    consensus_.QuarantineNode(msg.sender_id, "PRE_PREPARE block_hash mismatch");
+                    consensus_.ResetRound();
+                    ReplyJson(res, 403, Err("block_hash mismatch"));
+                    return;
+                }
+                // 验证通过，返回 200（Primary 会统计 200 响应作为 PREPARE 投票）
+                ReplyJson(res, 200, Ok({{"accepted", true}, {"phase", "PREPARE"}}));
+                return;
+
+            } else if (msg.type == "PREPARE") {
+                // ── 收到 PREPARE ──
+                bool quorum = false;
+                if (!consensus_.OnPrepare(msg, quorum)) {
+                    ReplyJson(res, 400, Err("PREPARE rejected"));
+                    return;
+                }
+                if (quorum) {
+                    // 达到 quorum，广播 COMMIT
+                ConsensusMessage commit;
+                    commit.msg_id = config_.node_id + ":" + std::to_string(msg.height) + ":" + std::to_string(msg.view) + ":commit";
+                    commit.type = "COMMIT";
+                    commit.chain_id = config_.chain_id;
+                    commit.height = msg.height;
+                    commit.view = msg.view;
+                    commit.instance_id = msg.instance_id;
+                    commit.block_hash = msg.block_hash;
+                    commit.sender_id = config_.node_id;
+                    commit.timestamp = NowMillis();
+                    commit.signature_hex = crypto::SignDetachedHex(SerializeConsensusMessageForSign(commit), consensus_.GetNodePrivateKey());
+                    BroadcastConsensusMessage(commit);
+                }
+                ReplyJson(res, 200, Ok({{"accepted", true}, {"phase", "PREPARE"}, {"quorum", quorum}}));
+
+            } else if (msg.type == "COMMIT") {
+                // ── 收到 COMMIT（来自 Primary） ──
+                // 备份节点：验证区块并提交
+                const auto& round = consensus_.CurrentRound();
+                if (round.proposed_block.header.height == msg.height && round.proposed_block.header.block_hash == msg.block_hash) {
+                    // 区块已在 PRE_PREPARE 阶段验证过，直接提交
+                    CommitBlockWithSignatures(round.proposed_block, {});
+                    consensus_.ResetRound();
+                    Logger::Info("backup committed block #" + std::to_string(msg.height));
+                }
+                // 生成本节点的 COMMIT 签名
+                std::string my_sig = crypto::SignDetachedHex(SerializeConsensusMessageForSign(msg), consensus_.GetNodePrivateKey());
+                ReplyJson(res, 200, Ok({{"accepted", true}, {"phase", "COMMIT"}, {"signature", my_sig}}));
+
+            } else if (msg.type == "VIEW_CHANGE") {
+                // ── 收到 VIEW_CHANGE ──
+                bool quorum = false;
+                uint64_t new_view = 0;
+                consensus_.OnViewChange(msg, quorum, new_view);
+                if (quorum) {
+                    consensus_.AdvanceView();
+                    // 如果我是新 Primary，立即尝试出块
+                    if (consensus_.IsPrimary() && !mempool_.Pending().empty()) {
+                        std::thread([this]() { TryProposeBlock(); }).detach();
+                    }
+                }
+                ReplyJson(res, 200, Ok({{"accepted", true}, {"phase", "VIEW_CHANGE"}, {"quorum", quorum}}));
+
+            } else {
+                ReplyJson(res, 400, Err("unknown message type: " + msg.type));
             }
-            ReplyJson(res, accepted ? 200 : 409, accepted ? Ok({{"accepted", true}}) : Err(evidence));
         } catch (const std::exception& e) {
             ReplyJson(res, 400, Err(e.what()));
         }
@@ -725,6 +847,13 @@ void ApiServer::RegisterRoutes(httplib::Server& server) {
             auto j = nlohmann::json::parse(req.body);
             Block block = BlockFromJson(j);
 
+            // 检查 proposer 是否已被隔离
+            if (consensus_.IsQuarantined(block.header.proposer_id)) {
+                Logger::Warn("sync block #" + std::to_string(block.header.height) + " rejected: proposer " + block.header.proposer_id + " is quarantined");
+                ReplyJson(res, 403, Err("proposer " + block.header.proposer_id + " is quarantined"));
+                return;
+            }
+
             // 检查高度是否连续
             uint64_t local_height = std::stoull(storage_.GetMetadata("latest_height", "0"));
             if (block.header.height <= local_height) {
@@ -733,7 +862,19 @@ void ApiServer::RegisterRoutes(httplib::Server& server) {
                 return;
             }
             if (block.header.height > local_height + 1) {
-                ReplyJson(res, 400, Err("height gap: expected " + std::to_string(local_height + 1) + " got " + std::to_string(block.header.height)));
+                // 高度差距过大，触发区块追赶：从 proposer 的节点拉取缺失区块
+                Logger::Info("height gap detected: local=" + std::to_string(local_height) + " incoming=" + std::to_string(block.header.height) + ", triggering catch-up");
+                // 查找 proposer 对应的 peer 配置
+                for (const auto& peer : config_.peers) {
+                    if (peer.node_id == block.header.proposer_id) {
+                        // 异步追赶，不阻塞当前请求
+                        std::thread([this, peer, local_height, target = block.header.height]() {
+                            CatchUpBlocks(peer, local_height + 1, target);
+                        }).detach();
+                        break;
+                    }
+                }
+                ReplyJson(res, 200, Ok({{"status", "CATCH_UP_TRIGGERED"}, {"from", local_height + 1}, {"to", block.header.height}}));
                 return;
             }
 
@@ -748,7 +889,8 @@ void ApiServer::RegisterRoutes(httplib::Server& server) {
             // 验证 Merkle 根
             std::string real_merkle = HashToHex(MerkleTree::ComputeRoot(block.transactions));
             if (real_merkle != block.header.tx_merkle_root) {
-                Logger::Warn("sync block #" + std::to_string(block.header.height) + " rejected: merkle root mismatch");
+                Logger::Warn("sync block #" + std::to_string(block.header.height) + " rejected: merkle root mismatch, quarantining " + block.header.proposer_id);
+                consensus_.QuarantineNode(block.header.proposer_id, "merkle_root_mismatch at height " + std::to_string(block.header.height));
                 ReplyJson(res, 403, Err("merkle root mismatch: expected " + real_merkle));
                 return;
             }
@@ -756,7 +898,8 @@ void ApiServer::RegisterRoutes(httplib::Server& server) {
             // 验证 state_root
             std::string real_state = executor_.ExecuteForStateRoot(block.transactions);
             if (real_state != block.header.state_root) {
-                Logger::Warn("sync block #" + std::to_string(block.header.height) + " rejected: state root mismatch");
+                Logger::Warn("sync block #" + std::to_string(block.header.height) + " rejected: state root mismatch, quarantining " + block.header.proposer_id);
+                consensus_.QuarantineNode(block.header.proposer_id, "state_root_mismatch at height " + std::to_string(block.header.height));
                 ReplyJson(res, 403, Err("state root mismatch: expected " + real_state));
                 return;
             }
@@ -766,7 +909,8 @@ void ApiServer::RegisterRoutes(httplib::Server& server) {
             std::string saved_hash = hdr.block_hash;
             hdr.block_hash = "";
             if (ComputeBlockHash(hdr) != saved_hash) {
-                Logger::Warn("sync block #" + std::to_string(block.header.height) + " rejected: block hash mismatch");
+                Logger::Warn("sync block #" + std::to_string(block.header.height) + " rejected: block hash mismatch, quarantining " + block.header.proposer_id);
+                consensus_.QuarantineNode(block.header.proposer_id, "block_hash_mismatch at height " + std::to_string(block.header.height));
                 ReplyJson(res, 403, Err("block hash mismatch"));
                 return;
             }
@@ -782,20 +926,97 @@ void ApiServer::RegisterRoutes(httplib::Server& server) {
             ReplyJson(res, 400, Err(e.what()));
         }
     });
+
+    // 提供区块范围查询，供追赶同步使用
+    server.Get("/p2p/sync/blocks", [this](const httplib::Request& req, httplib::Response& res) {
+        try {
+            uint64_t from = 1;
+            uint64_t to = std::stoull(storage_.GetMetadata("latest_height", "0"));
+            if (req.has_param("from")) from = std::stoull(req.get_param_value("from"));
+            if (req.has_param("to")) to = std::stoull(req.get_param_value("to"));
+            if (from > to) { ReplyJson(res, 400, Err("from > to")); return; }
+            if (to - from > 100) { ReplyJson(res, 400, Err("range too large (max 100)")); return; }
+
+            nlohmann::json arr = nlohmann::json::array();
+            for (uint64_t h = from; h <= to; ++h) {
+                auto block = storage_.GetBlockByHeight(h);
+                if (block) arr.push_back(BlockToJson(*block));
+            }
+            ReplyJson(res, 200, Ok({{"blocks", arr}, {"from", from}, {"to", to}}));
+        } catch (const std::exception& e) {
+            ReplyJson(res, 400, Err(e.what()));
+        }
+    });
+
+    // 提供用户数据查询，供链重组时同步用户
+    server.Get("/p2p/sync/users", [this](const httplib::Request&, httplib::Response& res) {
+        auto users = storage_.GetAllUsers();
+        nlohmann::json arr = nlohmann::json::array();
+        for (const auto& u : users) {
+            arr.push_back({{"username", u.username}, {"password_hash", u.password_hash},
+                           {"address", u.address}, {"public_key", u.public_key},
+                           {"private_key_encrypted", u.private_key_encrypted}, {"created_at", u.created_at}});
+        }
+        ReplyJson(res, 200, Ok({{"users", arr}}));
+    });
+
+    // 手动触发区块追赶
+    server.Post("/api/admin/sync", [this](const httplib::Request&, httplib::Response& res) {
+        uint64_t local_height = std::stoull(storage_.GetMetadata("latest_height", "0"));
+        // 查询所有 peer 的最高区块高度
+        uint64_t max_height = local_height;
+        std::string best_peer_id;
+        for (const auto& peer : config_.peers) {
+            if (consensus_.IsQuarantined(peer.node_id)) continue;
+            try {
+                httplib::Client client(peer.host, peer.rest_port);
+                client.set_connection_timeout(2);
+                client.set_read_timeout(3);
+                auto r = client.Get("/api/node/status");
+                if (r && r->status == 200) {
+                    auto j = nlohmann::json::parse(r->body);
+                    uint64_t h = std::stoull(j["data"].value("latest_height", "0"));
+                    if (h > max_height) {
+                        max_height = h;
+                        best_peer_id = peer.node_id;
+                    }
+                }
+            } catch (...) {}
+        }
+        if (max_height <= local_height) {
+            ReplyJson(res, 200, Ok({{"status", "ALREADY_UP_TO_DATE"}, {"height", local_height}}));
+            return;
+        }
+        // 找到最佳 peer 并触发追赶
+        for (const auto& peer : config_.peers) {
+            if (peer.node_id == best_peer_id) {
+                Logger::Info("manual sync: catching up from " + std::to_string(local_height + 1) + " to " + std::to_string(max_height) + " via " + peer.node_id);
+                std::thread([this, peer, local_height, max_height]() {
+                    CatchUpBlocks(peer, local_height + 1, max_height);
+                }).detach();
+                ReplyJson(res, 200, Ok({{"status", "SYNC_STARTED"}, {"from", local_height + 1}, {"to", max_height}, {"via", best_peer_id}}));
+                return;
+            }
+        }
+        ReplyJson(res, 200, Ok({{"status", "NO_PEER_FOUND"}, {"height", local_height}}));
+    });
 }
 
 void ApiServer::Run() {
     httplib::Server server;
     RegisterRoutes(server);
     Logger::Info("listening REST/P2P on port " + std::to_string(config_.rest_port));
-    // 演示实现先复用一个 httplib 端口承载 REST 与 P2P 路由；配置仍保留 p2p_port，后续可拆成双 server。
     server.listen("0.0.0.0", config_.rest_port);
 }
 
 void ApiServer::BroadcastBlock(const Block& block) {
-    // 异步广播区块到所有 peer 节点
+    // 异步广播区块到所有 peer 节点（跳过已隔离的节点）
     auto block_json = BlockToJson(block).dump();
     for (const auto& peer : config_.peers) {
+        if (consensus_.IsQuarantined(peer.node_id)) {
+            Logger::Info("skip broadcast to quarantined node " + peer.node_id);
+            continue;
+        }
         std::thread([peer, block_json]() {
             try {
                 httplib::Client client(peer.host, peer.rest_port);
@@ -812,6 +1033,460 @@ void ApiServer::BroadcastBlock(const Block& block) {
             }
         }).detach();
     }
+}
+
+void ApiServer::BroadcastBlockToPeer(const Block& block, size_t peer_idx) {
+    // 向单个 peer 发送区块（用于 double_proposal 攻击模拟）
+    if (peer_idx >= config_.peers.size()) return;
+    const auto& peer = config_.peers[peer_idx];
+    if (consensus_.IsQuarantined(peer.node_id)) return;
+    auto block_json = BlockToJson(block).dump();
+    std::thread([peer, block_json]() {
+        try {
+            httplib::Client client(peer.host, peer.rest_port);
+            client.set_connection_timeout(3);
+            client.set_read_timeout(5);
+            auto res = client.Post("/p2p/sync/block", block_json, "application/json");
+            if (res && res->status == 200) {
+                Logger::Info("synced block to " + peer.node_id + " (selective)");
+            } else {
+                Logger::Warn("selective sync to " + peer.node_id + " failed: " + (res ? std::to_string(res->status) : "no response"));
+            }
+        } catch (const std::exception& e) {
+            Logger::Warn("selective sync to " + peer.node_id + " exception: " + e.what());
+        }
+    }).detach();
+}
+
+void ApiServer::CatchUpBlocks(const PeerConfig& peer, uint64_t from_height, uint64_t target_height) {
+    Logger::Info("catch-up: fetching blocks " + std::to_string(from_height) + " to " + std::to_string(target_height) + " from " + peer.node_id);
+
+    httplib::Client client(peer.host, peer.rest_port);
+    client.set_connection_timeout(5);
+    client.set_read_timeout(10);
+
+    // 检查是否需要链重组：比较本地和 peer 在 from_height 处的区块哈希
+    bool need_reorg = false;
+    auto local_block = storage_.GetBlockByHeight(from_height);
+    if (local_block) {
+        auto res = client.Get("/api/blocks/" + std::to_string(from_height));
+        if (res && res->status == 200) {
+            auto peer_block = BlockFromJson(nlohmann::json::parse(res->body)["data"]);
+            if (peer_block.header.block_hash != local_block->header.block_hash) {
+                need_reorg = true;
+                Logger::Info("catch-up: chain fork detected at height " + std::to_string(from_height) + ", will reorg");
+            }
+        }
+    }
+
+    if (need_reorg) {
+        // 链重组：需要从 height=1 开始重建。
+        // 清空 SMT 和区块表，重新拉取并应用所有区块。
+        Logger::Info("catch-up: starting chain reorg from height 1 to " + std::to_string(target_height));
+        executor_.ResetSMT();
+
+        // 从 peer 批量拉取区块
+        std::vector<Block> peer_blocks;
+        for (uint64_t h = 1; h <= target_height; ++h) {
+            auto res = client.Get("/api/blocks/" + std::to_string(h));
+            if (!res || res->status != 200) {
+                Logger::Warn("catch-up: reorg failed: cannot fetch block #" + std::to_string(h) + " from " + peer.node_id);
+                return;
+            }
+            peer_blocks.push_back(BlockFromJson(nlohmann::json::parse(res->body)["data"]));
+        }
+
+        // 验证 peer 区块链内部连续性
+        for (size_t i = 0; i < peer_blocks.size(); ++i) {
+            const auto& block = peer_blocks[i];
+            std::string expected_prev = (i == 0) ? std::string(64, '0') : peer_blocks[i - 1].header.block_hash;
+            if (block.header.previous_block_hash != expected_prev) {
+                Logger::Warn("catch-up: reorg failed: peer chain not internally consistent at height " + std::to_string(block.header.height));
+                consensus_.QuarantineNode(peer.node_id, "catch-up peer chain inconsistent at height " + std::to_string(block.header.height));
+                return;
+            }
+            // 验证 Merkle 根
+            std::string real_merkle = HashToHex(MerkleTree::ComputeRoot(block.transactions));
+            if (real_merkle != block.header.tx_merkle_root) {
+                Logger::Warn("catch-up: reorg failed: merkle mismatch at height " + std::to_string(block.header.height));
+                consensus_.QuarantineNode(peer.node_id, "catch-up merkle mismatch at height " + std::to_string(block.header.height));
+                return;
+            }
+            // 验证 block_hash
+            BlockHeader hdr = block.header;
+            std::string saved_hash = hdr.block_hash;
+            hdr.block_hash = "";
+            if (ComputeBlockHash(hdr) != saved_hash) {
+                Logger::Warn("catch-up: reorg failed: hash mismatch at height " + std::to_string(block.header.height));
+                consensus_.QuarantineNode(peer.node_id, "catch-up hash mismatch at height " + std::to_string(block.header.height));
+                return;
+            }
+        }
+
+        // 全部验证通过，清空旧区块数据并重新应用
+        storage_.ClearChainData();
+        storage_.PutMetadata("latest_height", "0");
+
+        // 同步用户数据（用户注册是链下操作，不包含在区块中）
+        auto users_res = client.Get("/p2p/sync/users");
+        if (users_res && users_res->status == 200) {
+            try {
+                auto users_json = nlohmann::json::parse(users_res->body)["data"]["users"];
+                for (const auto& u : users_json) {
+                    storage_.PutUser(u["username"].get<std::string>(),
+                                     u["password_hash"].get<std::string>(),
+                                     u["address"].get<std::string>(),
+                                     u["public_key"].get<std::string>(),
+                                     u.value("private_key_encrypted", ""),
+                                     u.value("created_at", 0));
+                }
+                Logger::Info("catch-up: synced " + std::to_string(users_json.size()) + " users from " + peer.node_id);
+            } catch (const std::exception& e) {
+                Logger::Warn("catch-up: failed to sync users: " + std::string(e.what()));
+            }
+        }
+
+        for (const auto& block : peer_blocks) {
+            // 逐块提交，跳过 state_root 验证（SMT 和账户状态正在重建中）
+            executor_.CommitBlock(block);
+            Logger::Info("catch-up: reorg applied block #" + std::to_string(block.header.height));
+            consensus_.AddEvent({0, 0, "", block.header.height, block.header.view, block.header.instance_id,
+                                 "CATCH_UP_REORG", peer.node_id, config_.node_id, block.header.block_hash, true, "", ""});
+        }
+        uint64_t final_height = std::stoull(storage_.GetMetadata("latest_height", "0"));
+        Logger::Info("catch-up: reorg complete, now at height " + std::to_string(final_height));
+        consensus_.AddEvent({0, 0, "", final_height, 0, 0, "CATCH_UP_COMPLETE", peer.node_id, config_.node_id, "", true, "chain reorg", ""});
+        return;
+    }
+
+    // 简单追赶（链未分叉，只是高度落后）：逐块拉取并应用
+    std::string prev_hash = std::string(64, '0');
+    if (from_height > 1) {
+        auto local_prev = storage_.GetBlockByHeight(from_height - 1);
+        if (local_prev) prev_hash = local_prev->header.block_hash;
+    }
+
+    for (uint64_t h = from_height; h <= target_height; ++h) {
+        auto existing = storage_.GetBlockByHeight(h);
+        if (existing) {
+            prev_hash = existing->header.block_hash;
+            continue;
+        }
+
+        auto res = client.Get("/api/blocks/" + std::to_string(h));
+        if (!res || res->status != 200) {
+            Logger::Warn("catch-up: failed to fetch block #" + std::to_string(h) + " from " + peer.node_id);
+            return;
+        }
+
+        try {
+            Block block = BlockFromJson(nlohmann::json::parse(res->body)["data"]);
+
+            // 验证 prev_hash 连续性
+            if (block.header.previous_block_hash != prev_hash) {
+                Logger::Warn("catch-up: block #" + std::to_string(h) + " prev_hash mismatch, need full reorg");
+                // 触发完整重新同步
+                CatchUpBlocks(peer, 1, target_height);
+                return;
+            }
+
+            // 验证 Merkle 根
+            std::string real_merkle = HashToHex(MerkleTree::ComputeRoot(block.transactions));
+            if (real_merkle != block.header.tx_merkle_root) {
+                Logger::Warn("catch-up: block #" + std::to_string(h) + " merkle mismatch");
+                consensus_.QuarantineNode(peer.node_id, "catch-up merkle mismatch at height " + std::to_string(h));
+                return;
+            }
+
+            // 注意：跳过 state_root 验证。追赶同步时本地账户状态可能不完整（缺少初始余额），
+            // 无法独立重算 state_root。Merkle 根和区块哈希验证已保证区块内容完整性。
+
+            // 验证 block_hash
+            BlockHeader hdr = block.header;
+            std::string saved_hash = hdr.block_hash;
+            hdr.block_hash = "";
+            if (ComputeBlockHash(hdr) != saved_hash) {
+                Logger::Warn("catch-up: block #" + std::to_string(h) + " hash mismatch");
+                consensus_.QuarantineNode(peer.node_id, "catch-up hash mismatch at height " + std::to_string(h));
+                return;
+            }
+
+            executor_.CommitBlock(block);
+            prev_hash = block.header.block_hash;
+            Logger::Info("catch-up: applied block #" + std::to_string(h));
+            consensus_.AddEvent({0, 0, "", h, block.header.view, block.header.instance_id,
+                                 "CATCH_UP_BLOCK", peer.node_id, config_.node_id, block.header.block_hash, true, "", ""});
+        } catch (const std::exception& e) {
+            Logger::Warn("catch-up: exception at block #" + std::to_string(h) + ": " + e.what());
+            return;
+        }
+    }
+    // 同步用户数据（无论简单追赶还是重组都需要）
+    auto users_res = client.Get("/p2p/sync/users");
+    if (users_res && users_res->status == 200) {
+        try {
+            auto users_json = nlohmann::json::parse(users_res->body)["data"]["users"];
+            for (const auto& u : users_json) {
+                storage_.PutUser(u["username"].get<std::string>(),
+                                 u["password_hash"].get<std::string>(),
+                                 u["address"].get<std::string>(),
+                                 u["public_key"].get<std::string>(),
+                                 u.value("private_key_encrypted", ""),
+                                 u.value("created_at", 0));
+            }
+            Logger::Info("catch-up: synced " + std::to_string(users_json.size()) + " users from " + peer.node_id);
+        } catch (const std::exception& e) {
+            Logger::Warn("catch-up: failed to sync users: " + std::string(e.what()));
+        }
+    }
+
+    uint64_t final_height = std::stoull(storage_.GetMetadata("latest_height", "0"));
+    Logger::Info("catch-up: complete, now at height " + std::to_string(final_height));
+    consensus_.AddEvent({0, 0, "", final_height, 0, 0, "CATCH_UP_COMPLETE", peer.node_id, config_.node_id, "", true, "", ""});
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// PBFT 共识消息广播
+// ══════════════════════════════════════════════════════════════════════════════
+
+void ApiServer::BroadcastConsensusMessage(const ConsensusMessage& msg) {
+    // 同步广播（httplib handler 已在独立线程中运行）
+    auto msg_json = ConsensusMessageToJson(msg).dump();
+    for (const auto& peer : config_.peers) {
+        if (consensus_.IsQuarantined(peer.node_id)) continue;
+        try {
+            httplib::Client client(peer.host, peer.rest_port);
+            client.set_connection_timeout(2);
+            client.set_read_timeout(5);
+            auto res = client.Post("/p2p/consensus/message", msg_json, "application/json");
+            if (res && res->status == 200) {
+                Logger::Info("sent " + msg.type + " to " + peer.node_id + ": OK");
+            }
+        } catch (...) {}
+    }
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// PBFT 共识定时器
+// ══════════════════════════════════════════════════════════════════════════════
+
+void ApiServer::ConsensusTimerLoop() {
+    while (!stop_timer_) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(2000));
+
+        if (!consensus_.IsRunning()) continue;
+        if (!storage_.Raw()) continue;  // DB 未初始化
+
+        // 检查是否需要 View Change（当前轮次超时）
+        if (consensus_.ShouldViewChange()) {
+            Logger::Warn("consensus timeout, triggering view change");
+            auto vc = consensus_.CreateViewChange();
+            BroadcastConsensusMessage(vc);
+            // 自己也处理
+            bool quorum = false;
+            uint64_t new_view = 0;
+            consensus_.OnViewChange(vc, quorum, new_view);
+            if (quorum) {
+                consensus_.AdvanceView();
+            }
+            continue;
+        }
+
+        // 如果我是 Primary 且 mempool 有交易且当前没有进行中的轮次
+        // 在新线程中出块，避免阻塞定时器
+        if (consensus_.IsPrimary() && consensus_.CurrentRound().phase == ConsensusPhase::IDLE) {
+            if (!mempool_.Pending().empty()) {
+                std::thread([this]() { TryProposeBlock(); }).detach();
+            }
+        }
+    }
+}
+
+void ApiServer::TryProposeBlock() {
+    try {
+        auto picked = mempool_.PickTransactions(100);
+        if (picked.empty()) return;
+
+        // 过滤掉无法执行的交易（余额不足等）
+        std::vector<Transaction> valid_txs;
+        for (const auto& tx : picked) {
+            try {
+                std::vector<Transaction> single{tx};
+                executor_.ExecuteForStateRoot(single);
+                valid_txs.push_back(tx);
+            } catch (const std::exception& e) {
+                Logger::Warn("dropping invalid tx " + tx.tx_id.substr(0, 16) + ": " + e.what());
+                mempool_.RemoveCommitted({tx});
+            }
+        }
+        if (valid_txs.empty()) return;
+
+        Block block;
+        block.transactions = valid_txs;
+        block.header.chain_id = config_.chain_id;
+        block.header.height = std::stoull(storage_.GetMetadata("latest_height", "0")) + 1;
+        auto latest = storage_.GetLatestBlock();
+        block.header.previous_block_hash = latest ? latest->header.block_hash : std::string(64, '0');
+        block.header.tx_merkle_root = HashToHex(MerkleTree::ComputeRoot(picked));
+        block.header.state_root = executor_.ExecuteForStateRoot(picked);
+        block.header.timestamp = NowMillis();
+        block.header.view = consensus_.CurrentView();
+        block.header.instance_id = 0;
+        block.header.proposer_id = config_.node_id;
+        block.header.block_hash = ComputeBlockHash(block.header);
+
+        // 攻击模式
+        auto mode = consensus_.GetAttackMode();
+        if (mode == AttackMode::BAD_MERKLE_ROOT) {
+            block.header.tx_merkle_root = std::string(64, '0');
+            Logger::Warn("attack: tampered merkle root on block #" + std::to_string(block.header.height));
+        } else if (mode == AttackMode::BAD_STATE_ROOT) {
+            block.header.state_root = std::string(64, '0');
+            Logger::Warn("attack: tampered state root on block #" + std::to_string(block.header.height));
+        } else if (mode == AttackMode::INVALID_BLOCK_HASH) {
+            block.header.block_hash = std::string(64, '0');
+            Logger::Warn("attack: tampered block hash on block #" + std::to_string(block.header.height));
+        } else if (mode == AttackMode::DOUBLE_PROPOSAL) {
+            // 发送两个不同的 PRE_PREPARE
+            Block tampered = block;
+            tampered.header.state_root = std::string(64, '0');
+            tampered.header.block_hash = ComputeBlockHash(tampered.header);
+            Logger::Warn("attack: double_proposal on block #" + std::to_string(block.header.height));
+            auto normal_msg = consensus_.CreatePrePrepare(block);
+            auto tampered_msg = consensus_.CreatePrePrepare(tampered);
+            // 正常消息发给第一个 peer，篡改消息发给其余 peer
+            if (!config_.peers.empty()) {
+                auto normal_json = ConsensusMessageToJson(normal_msg).dump();
+                auto tampered_json = ConsensusMessageToJson(tampered_msg).dump();
+                for (size_t i = 0; i < config_.peers.size(); ++i) {
+                    const auto& peer = config_.peers[i];
+                    auto& json = (i == 0) ? normal_json : tampered_json;
+                    std::thread([peer, json]() {
+                        try {
+                            httplib::Client client(peer.host, peer.rest_port);
+                            client.set_connection_timeout(3);
+                            client.set_read_timeout(5);
+                            client.Post("/p2p/consensus/message", json, "application/json");
+                        } catch (...) {}
+                    }).detach();
+                }
+            }
+            return;
+        }
+
+        // 创建 PRE_PREPARE
+        auto pre_prepare = consensus_.CreatePrePrepare(block);
+        auto pre_prepare_json = ConsensusMessageToJson(pre_prepare).dump();
+
+        // Phase 1: 发送 PRE_PREPARE 给所有备份节点，统计接受数
+        int prepare_votes = 1;  // 自己算一票
+        for (const auto& peer : config_.peers) {
+            if (consensus_.IsQuarantined(peer.node_id)) continue;
+            try {
+                httplib::Client client(peer.host, peer.rest_port);
+                client.set_connection_timeout(2);
+                client.set_read_timeout(5);
+                auto res = client.Post("/p2p/consensus/message", pre_prepare_json, "application/json");
+                if (res && res->status == 200) {
+                    prepare_votes++;
+                    Logger::Info("PRE_PREPARE accepted by " + peer.node_id);
+                } else {
+                    Logger::Warn("PRE_PREPARE rejected by " + peer.node_id + ": " + (res ? std::to_string(res->status) : "no response"));
+                }
+            } catch (const std::exception& e) {
+                Logger::Warn("PRE_PREPARE send to " + peer.node_id + " failed: " + e.what());
+            }
+        }
+
+        Logger::Info("PRE_PREPARE votes: " + std::to_string(prepare_votes) + "/" + std::to_string(consensus_.Quorum()));
+
+        if (prepare_votes < consensus_.Quorum()) {
+            Logger::Warn("insufficient PREPARE votes, aborting");
+            consensus_.ResetRound();
+            return;
+        }
+
+        // Phase 2: 发送 COMMIT 给所有备份节点
+        ConsensusMessage commit_msg;
+        commit_msg.msg_id = config_.node_id + ":" + std::to_string(block.header.height) + ":" + std::to_string(consensus_.CurrentView()) + ":commit";
+        commit_msg.type = "COMMIT";
+        commit_msg.chain_id = config_.chain_id;
+        commit_msg.height = block.header.height;
+        commit_msg.view = consensus_.CurrentView();
+        commit_msg.instance_id = 0;
+        commit_msg.block_hash = block.header.block_hash;
+        commit_msg.sender_id = config_.node_id;
+        commit_msg.timestamp = NowMillis();
+        commit_msg.signature_hex = crypto::SignDetachedHex(SerializeConsensusMessageForSign(commit_msg), consensus_.GetNodePrivateKey());
+        auto commit_json = ConsensusMessageToJson(commit_msg).dump();
+
+        int commit_votes = 1;  // 自己算一票
+        std::vector<NodeSignature> sigs;
+        NodeSignature self_sig;
+        self_sig.node_id = config_.node_id;
+        self_sig.signature_hex = commit_msg.signature_hex;
+        sigs.push_back(self_sig);
+
+        for (const auto& peer : config_.peers) {
+            if (consensus_.IsQuarantined(peer.node_id)) continue;
+            try {
+                httplib::Client client(peer.host, peer.rest_port);
+                client.set_connection_timeout(2);
+                client.set_read_timeout(5);
+                auto res = client.Post("/p2p/consensus/message", commit_json, "application/json");
+                if (res && res->status == 200) {
+                    commit_votes++;
+                    // 收集签名
+                    NodeSignature sig;
+                    sig.node_id = peer.node_id;
+                    try {
+                        auto body = nlohmann::json::parse(res->body);
+                        if (body.contains("data") && body["data"].contains("signature")) {
+                            sig.signature_hex = body["data"]["signature"].get<std::string>();
+                        }
+                    } catch (...) {}
+                    sigs.push_back(sig);
+                    Logger::Info("COMMIT accepted by " + peer.node_id);
+                }
+            } catch (...) {}
+        }
+
+        Logger::Info("COMMIT votes: " + std::to_string(commit_votes) + "/" + std::to_string(consensus_.Quorum()));
+
+        if (commit_votes < consensus_.Quorum()) {
+            Logger::Warn("insufficient COMMIT votes, aborting");
+            consensus_.ResetRound();
+            return;
+        }
+
+        // Phase 3: 提交区块
+        CommitBlockWithSignatures(block, sigs);
+        consensus_.ResetRound();
+
+        Logger::Info("proposed and committed block #" + std::to_string(block.header.height) + " hash=" + block.header.block_hash.substr(0, 16) + "...");
+    } catch (const std::exception& e) {
+        Logger::Warn("propose block failed: " + std::string(e.what()));
+    }
+}
+
+void ApiServer::CommitBlockWithSignatures(const Block& block, const std::vector<NodeSignature>& sigs) {
+    // 验证 state_root
+    std::string real_state = executor_.ExecuteForStateRoot(block.transactions);
+    if (real_state != block.header.state_root) {
+        Logger::Warn("commit rejected: state_root mismatch at height " + std::to_string(block.header.height));
+        return;
+    }
+
+    // 提交区块（带签名）
+    Block committed_block = block;
+    committed_block.commit_signatures = sigs;
+    executor_.CommitBlock(committed_block);
+    mempool_.RemoveCommitted(block.transactions);
+
+    Logger::Info("committed block #" + std::to_string(block.header.height) + " with " + std::to_string(sigs.size()) + " signatures");
+    consensus_.AddEvent({0, 0, "", block.header.height, block.header.view, block.header.instance_id,
+                         "BLOCK_COMMITTED", block.header.proposer_id, config_.node_id, block.header.block_hash,
+                         true, "sigs=" + std::to_string(sigs.size()), ""});
 }
 
 } // namespace rbft

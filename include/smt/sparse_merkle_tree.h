@@ -45,6 +45,11 @@ public:
     static Hash LeafHash(const Hash& key, const Hash& value_hash);
     static Hash ParentHash(const Hash& left, const Hash& right);
 
+    // 持久化支持：导出/加载叶子数据
+    struct LeafData { Hash key; Hash value_hash; std::vector<unsigned char> value; };
+    std::vector<LeafData> GetAllLeaves() const;
+    void LoadLeaf(const Hash& key, const Hash& value_hash, const std::vector<unsigned char>& value);
+
 private:
     struct Leaf {
         Hash key;

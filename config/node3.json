@@ -4,15 +4,33 @@
   "p2p_port": 9003,
   "db_path": "data/node3/chain.db",
   "node_private_key_path": "data/node3/node.key",
-  "node_public_key": "",
+  "node_public_key": "3994f4f7e7c38e51a04910ecac21d1fa550df5c2de16d6c6f2ca80b866eb464c",
   "chain_id": "rbft-demo-chain",
   "f": 1,
   "instance_count": 2,
   "block_interval_ms": 1500,
   "consensus_timeout_ms": 5000,
   "peers": [
-    {"node_id": "node1", "host": "localhost", "rest_port": 8001, "p2p_port": 9001, "public_key": ""},
-    {"node_id": "node2", "host": "localhost", "rest_port": 8002, "p2p_port": 9002, "public_key": ""},
-    {"node_id": "node4", "host": "localhost", "rest_port": 8004, "p2p_port": 9004, "public_key": ""}
+    {
+      "node_id": "node1",
+      "host": "localhost",
+      "rest_port": 8001,
+      "p2p_port": 9001,
+      "public_key": "7cb758ab0bd3afdd922a36ff156e52e33d1f83ab9823a077b76a1ee12e4e93cb"
+    },
+    {
+      "node_id": "node2",
+      "host": "localhost",
+      "rest_port": 8002,
+      "p2p_port": 9002,
+      "public_key": "49a4450175f838d8dda8a6c645eeb82cfe525ffd3d92b62999514f72c5fdd727"
+    },
+    {
+      "node_id": "node4",
+      "host": "localhost",
+      "rest_port": 8004,
+      "p2p_port": 9004,
+      "public_key": "44ccfe9238e811d1313bcabd54fb39c1415dda43be437eaccf0fd67ef817e1f9"
+    }
   ]
 }

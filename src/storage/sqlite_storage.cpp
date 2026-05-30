@@ -214,4 +214,118 @@ std::string SQLiteStorage::GetMetadata(const std::string& key, const std::string
     return value;
 }
 
+// ── SMT 持久化 ──
+
+void SQLiteStorage::PutSMTLeaf(const Hash& key, const Hash& value_hash, const std::vector<unsigned char>& value) {
+    sqlite3_stmt* stmt = nullptr;
+    const char* sql = "INSERT OR REPLACE INTO smt_nodes(node_hash, node_type, key_hash, value_hash, left_hash, right_hash, node_blob) VALUES(?,?,?,?,?,?,?);";
+    sqlite3_prepare_v2(db_, sql, -1, &stmt, nullptr);
+    auto key_hex = HashToHex(key);
+    auto val_hex = HashToHex(value_hash);
+    sqlite3_bind_text(stmt, 1, key_hex.c_str(), -1, SQLITE_TRANSIENT);  // node_hash = key hash
+    sqlite3_bind_text(stmt, 2, "LEAF", -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt, 3, key_hex.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt, 4, val_hex.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_null(stmt, 5);  // left_hash
+    sqlite3_bind_null(stmt, 6);  // right_hash
+    sqlite3_bind_blob(stmt, 7, value.data(), static_cast<int>(value.size()), SQLITE_TRANSIENT);
+    if (sqlite3_step(stmt) != SQLITE_DONE) {
+        sqlite3_finalize(stmt);
+        throw std::runtime_error("put smt leaf failed");
+    }
+    sqlite3_finalize(stmt);
+}
+
+std::vector<std::tuple<Hash, Hash, std::vector<unsigned char>>> SQLiteStorage::GetAllSMTLeaves() const {
+    std::vector<std::tuple<Hash, Hash, std::vector<unsigned char>>> result;
+    sqlite3_stmt* stmt = nullptr;
+    sqlite3_prepare_v2(db_, "SELECT key_hash, value_hash, node_blob FROM smt_nodes WHERE node_type='LEAF';", -1, &stmt, nullptr);
+    while (sqlite3_step(stmt) == SQLITE_ROW) {
+        auto key_hex = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 0));
+        auto val_hex = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 1));
+        auto blob = static_cast<const unsigned char*>(sqlite3_column_blob(stmt, 2));
+        int blob_size = sqlite3_column_bytes(stmt, 2);
+        Hash key = HexToHash(key_hex);
+        Hash vh = HexToHash(val_hex);
+        std::vector<unsigned char> value(blob, blob + blob_size);
+        result.emplace_back(key, vh, std::move(value));
+    }
+    sqlite3_finalize(stmt);
+    return result;
+}
+
+void SQLiteStorage::ClearSMTLeaves() {
+    Exec("DELETE FROM smt_nodes;");
+}
+
+void SQLiteStorage::PutStateRoot(uint64_t height, const std::string& state_root) {
+    sqlite3_stmt* stmt = nullptr;
+    sqlite3_prepare_v2(db_, "INSERT OR REPLACE INTO state_roots(height, state_root) VALUES(?,?);", -1, &stmt, nullptr);
+    sqlite3_bind_int64(stmt, 1, static_cast<sqlite3_int64>(height));
+    sqlite3_bind_text(stmt, 2, state_root.c_str(), -1, SQLITE_TRANSIENT);
+    if (sqlite3_step(stmt) != SQLITE_DONE) {
+        sqlite3_finalize(stmt);
+        throw std::runtime_error("put state root failed");
+    }
+    sqlite3_finalize(stmt);
+}
+
+std::string SQLiteStorage::GetStateRoot(uint64_t height) const {
+    sqlite3_stmt* stmt = nullptr;
+    sqlite3_prepare_v2(db_, "SELECT state_root FROM state_roots WHERE height=?;", -1, &stmt, nullptr);
+    sqlite3_bind_int64(stmt, 1, static_cast<sqlite3_int64>(height));
+    if (sqlite3_step(stmt) != SQLITE_ROW) {
+        sqlite3_finalize(stmt);
+        return "";
+    }
+    std::string value = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 0));
+    sqlite3_finalize(stmt);
+    return value;
+}
+
+void SQLiteStorage::ClearChainData() {
+    // 链重组时清空区块、交易、账户和状态根数据
+    Exec("DELETE FROM blocks;");
+    Exec("DELETE FROM transactions WHERE status='COMMITTED';");
+    Exec("DELETE FROM accounts;");
+    Exec("DELETE FROM state_roots;");
+    Exec("DELETE FROM smt_nodes;");
+    Exec("DELETE FROM node_metadata WHERE key='latest_height';");
+}
+
+std::vector<SQLiteStorage::UserSyncData> SQLiteStorage::GetAllUsers() const {
+    std::vector<UserSyncData> result;
+    sqlite3_stmt* stmt = nullptr;
+    sqlite3_prepare_v2(db_, "SELECT username, password_hash, address, public_key, private_key_encrypted, created_at FROM users;", -1, &stmt, nullptr);
+    while (sqlite3_step(stmt) == SQLITE_ROW) {
+        UserSyncData u;
+        u.username = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 0));
+        u.password_hash = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 1));
+        u.address = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 2));
+        u.public_key = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 3));
+        u.private_key_encrypted = sqlite3_column_text(stmt, 4) ? reinterpret_cast<const char*>(sqlite3_column_text(stmt, 4)) : "";
+        u.created_at = sqlite3_column_int64(stmt, 5);
+        result.push_back(std::move(u));
+    }
+    sqlite3_finalize(stmt);
+    return result;
+}
+
+void SQLiteStorage::PutUser(const std::string& username, const std::string& password_hash, const std::string& address, const std::string& public_key, const std::string& private_key_encrypted, int64_t created_at) {
+    sqlite3_stmt* stmt = nullptr;
+    const char* sql = "INSERT OR IGNORE INTO users(username, password_hash, address, public_key, private_key_encrypted, created_at) VALUES(?,?,?,?,?,?);";
+    sqlite3_prepare_v2(db_, sql, -1, &stmt, nullptr);
+    sqlite3_bind_text(stmt, 1, username.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt, 2, password_hash.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt, 3, address.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt, 4, public_key.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt, 5, private_key_encrypted.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_int64(stmt, 6, created_at);
+    if (sqlite3_step(stmt) != SQLITE_DONE) {
+        sqlite3_finalize(stmt);
+        throw std::runtime_error("put user failed");
+    }
+    sqlite3_finalize(stmt);
+}
+
 } // namespace rbft

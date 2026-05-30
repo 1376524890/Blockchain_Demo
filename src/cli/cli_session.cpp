@@ -8,6 +8,7 @@
 #include <iostream>
 #include <nlohmann/json.hpp>
 #include <sstream>
+#include <thread>
 
 namespace rbft {
 
@@ -570,9 +571,12 @@ void CliSession::DoQueryAccount() {
             std::cout << "  " << std::setw(6) << nodes_[r.node_idx].node_id << " │ "
                       << std::setw(6) << d.value("balance", 0ULL) << " │ "
                       << d.value("nonce", 0ULL) << "\n";
-        } else {
+        } else if (r.error.find("连接失败") != std::string::npos || r.error.find("connect") != std::string::npos) {
             std::cout << "  " << std::setw(6) << nodes_[r.node_idx].node_id << " │ "
                       << "  (离线)\n";
+        } else {
+            std::cout << "  " << std::setw(6) << nodes_[r.node_idx].node_id << " │ "
+                      << "  (账户不存在)\n";
         }
     }
     Pause();
@@ -691,21 +695,44 @@ void CliSession::DoNodeStatus() {
 void CliSession::DoAttackSimulation() {
     DbgSep("攻击模拟 - 拜占庭容错验证");
 
+    // Step 0: 检查当前主节点（攻击只有对主节点才可见效果）
+    DbgPrint("检测各节点角色...");
+    int primary_idx = 0;
+    {
+        auto status_results = BroadcastGet("/api/node/status");
+        for (const auto& r : status_results) {
+            if (!r.ok) continue;
+            auto d = json::parse(r.data);
+            auto consensus = d.value("consensus", json::object());
+            bool is_primary = consensus.value("is_primary", false);
+            std::cout << "  " << nodes_[r.node_idx].node_id << ": "
+                      << (is_primary ? "\033[33m主节点 (PRIMARY)\033[0m" : "备份节点")
+                      << "  height=" << d.value("latest_height", "0") << "\n";
+            if (is_primary) primary_idx = static_cast<int>(r.node_idx);
+        }
+    }
+
     // 选择恶意节点
     std::cout << "\n  选择恶意节点:\n";
     for (size_t i = 0; i < nodes_.size(); ++i) {
-        std::cout << "    " << (i + 1) << ". " << nodes_[i].node_id << "\n";
+        std::cout << "    " << (i + 1) << ". " << nodes_[i].node_id;
+        if (static_cast<int>(i) == primary_idx) std::cout << " \033[33m← 当前主节点 (推荐)\033[0m";
+        std::cout << "\n";
     }
     int bad_idx = PickNode("恶意节点 [1-" + std::to_string(nodes_.size()) + "]: ");
     if (bad_idx < 0 || bad_idx >= static_cast<int>(nodes_.size())) { PrintErr("无效选择"); return; }
+    if (bad_idx != primary_idx) {
+        std::cout << "  \033[33m注意: 选择的是备份节点，篡改类攻击(1-3)可能不会产生区块分歧。\033[0m\n";
+        std::cout << "  \033[33m只有主节点打包区块时攻击才会生效。消息丢弃类攻击(4-5)影响较小。\033[0m\n";
+    }
 
     // 选择攻击模式
     std::cout << "\n  攻击模式:\n";
-    std::cout << "    1. bad_merkle_root    篡改 Merkle 根\n";
-    std::cout << "    2. bad_state_root     篡改状态根\n";
-    std::cout << "    3. invalid_block_hash 篡改区块哈希\n";
-    std::cout << "    4. drop_prepare       丢弃 PREPARE\n";
-    std::cout << "    5. double_proposal    双重提议\n";
+    std::cout << "    1. bad_merkle_root     篡改 Merkle 根 (需主节点)\n";
+    std::cout << "    2. bad_state_root      篡改状态根 (需主节点)\n";
+    std::cout << "    3. invalid_block_hash  篡改区块哈希 (需主节点)\n";
+    std::cout << "    4. drop_prepare        丢弃 PREPARE 消息\n";
+    std::cout << "    5. double_proposal     双重提议 (需主节点)\n";
     int mode_choice = static_cast<int>(PromptUint64("攻击模式 [1-5]: "));
 
     std::string mode_name;
@@ -734,16 +761,17 @@ void CliSession::DoAttackSimulation() {
         PrintOk(nodes_[bad_idx].node_id + " → " + mode_name);
     }
 
-    // Step 3: 注册用户 (如果未登录)
+    // Step 3: 确保有两个不同用户（发送方 + 接收方）
+    DbgPrint("Step 3 - 准备交易双方...");
     if (active_user_ < 0) {
-        DbgPrint("Step 3 - 自动注册测试用户...");
-        json reg_body = {{"username", "attack_test"}, {"password", "test123456"}};
+        // 自动注册发送方
+        json reg_body = {{"username", "attacker"}, {"password", "test123456"}};
         auto reg_results = BroadcastPost("/api/users/register", reg_body.dump());
         for (const auto& r : reg_results) {
             if (r.ok) {
                 auto d = json::parse(r.data);
                 RemoteUser user;
-                user.username = "attack_test";
+                user.username = d.value("username", "attacker");
                 user.address = d.value("address", "");
                 user.public_key = d.value("public_key", "");
                 user.private_key = d.value("private_key", "");
@@ -753,27 +781,117 @@ void CliSession::DoAttackSimulation() {
             }
         }
     }
+    if (active_user_ < 0) { PrintErr("无法获取发送方用户"); return; }
+    const auto& sender = users_[active_user_];
 
-    if (active_user_ < 0) { PrintErr("无法获取用户信息"); return; }
-    const auto& user = users_[active_user_];
+    // 查找或选择接收方
+    std::string receiver_addr;
+    std::string receiver_name;
+    bool auto_victim = false;
 
-    // Step 4: 获取 nonce
+    // Step: 列出可选接收方，让用户手动选择
+    {
+        std::vector<std::pair<std::string, std::string>> candidates;  // {username, address}
+        std::string raw;
+        HttpGet(0, "/api/users?page=1&page_size=50", raw);
+        std::string data, err;
+        if (ParseOk(raw, data, err)) {
+            auto users_json = json::parse(data)["users"];
+            for (const auto& u : users_json) {
+                std::string uname = u.value("username", "");
+                std::string addr = u.value("address", "");
+                if (addr != sender.address && !addr.empty()) {
+                    candidates.push_back({uname, addr});
+                }
+            }
+        }
+
+        std::cout << "\n  选择转账目标:\n";
+        for (size_t ci = 0; ci < candidates.size(); ++ci) {
+            std::cout << "    " << (ci + 1) << ". " << std::setw(14) << candidates[ci].first
+                      << "  " << candidates[ci].second.substr(0, 20) << "...\n";
+        }
+        int auto_opt = static_cast<int>(candidates.size()) + 1;
+        int manual_opt = auto_opt + 1;
+        std::cout << "    " << auto_opt << ". 自动创建新接收方\n";
+        std::cout << "    " << manual_opt << ". 手动输入地址\n";
+
+        int choice = static_cast<int>(PromptUint64("选择 [1-" + std::to_string(manual_opt) + "]: "));
+        if (choice >= 1 && choice <= static_cast<int>(candidates.size())) {
+            receiver_name = candidates[static_cast<size_t>(choice - 1)].first;
+            receiver_addr = candidates[static_cast<size_t>(choice - 1)].second;
+        } else if (choice == auto_opt) {
+            // 自动创建
+            DbgPrint("  自动创建接收方...");
+            std::string vname = "victim";
+            json reg_body = {{"username", vname}, {"password", "test123456"}};
+            auto reg_results = BroadcastPost("/api/users/register", reg_body.dump());
+            for (const auto& r : reg_results) {
+                if (r.ok) {
+                    auto d = json::parse(r.data);
+                    receiver_name = vname;
+                    receiver_addr = d.value("address", "");
+                    RemoteUser victim;
+                    victim.username = vname;
+                    victim.address = receiver_addr;
+                    victim.public_key = d.value("public_key", "");
+                    victim.private_key = d.value("private_key", "");
+                    users_.push_back(victim);
+                    auto_victim = true;
+                    break;
+                }
+            }
+        } else if (choice == manual_opt) {
+            // 手动输入
+            receiver_addr = PromptLine("  输入接收方地址: ");
+            if (receiver_addr.size() < 10) {
+                PrintErr("地址无效");
+                return;
+            }
+            receiver_name = "手动输入";
+        } else {
+            PrintErr("无效选择");
+            return;
+        }
+    }
+    if (receiver_addr.empty()) { PrintErr("无法获取接收方地址"); return; }
+
+    std::cout << "  发送方: \033[33m" << sender.username << "\033[0m "
+              << sender.address.substr(0, 16) << "...\n";
+    std::cout << "  接收方: \033[33m" << receiver_name << "\033[0m "
+              << receiver_addr.substr(0, 16) << "...\n";
+
+    // Step 4: 查询发送方余额和 nonce
+    uint64_t sender_balance_before = 0;
     uint64_t nonce = 1;
     {
         std::string raw;
-        HttpGet(bad_idx, "/api/state/" + user.address, raw);
+        HttpGet(bad_idx, "/api/state/" + sender.address, raw);
         std::string d, e;
-        if (ParseOk(raw, d, e)) nonce = json::parse(d).value("nonce", 0ULL) + 1;
+        if (ParseOk(raw, d, e)) {
+            auto state = json::parse(d);
+            sender_balance_before = state.value("balance", 0ULL);
+            nonce = state.value("nonce", 0ULL) + 1;
+        }
     }
+    std::cout << "  发送方余额: " << sender_balance_before << "\n";
 
-    // Step 5: 构造交易并提交到恶意节点
-    DbgPrint("Step 3 - 提交交易到恶意节点 " + nodes_[bad_idx].node_id + "...");
+    // Step 5: 构造真实的转账交易 (发送方 → 接收方, 不同地址)
+    uint64_t transfer_amount = 50;  // 仿真转账金额
+    DbgPrint("Step 4 - 构造转账: " + sender.username + " → " + receiver_name + " amount=" + std::to_string(transfer_amount));
     json tx_body = {
-        {"type", "TRANSFER"}, {"from", user.address}, {"to", user.address},
-        {"amount", 1}, {"nonce", nonce}, {"timestamp", 0},
-        {"public_key", user.public_key}, {"private_key", user.private_key}
+        {"type", "TRANSFER"},
+        {"from", sender.address},
+        {"to", receiver_addr},
+        {"amount", transfer_amount},
+        {"nonce", nonce},
+        {"timestamp", 0},
+        {"public_key", sender.public_key},
+        {"private_key", sender.private_key}
     };
 
+    // Step 6: 提交交易到恶意节点
+    DbgPrint("Step 5 - 提交交易到恶意节点 " + nodes_[bad_idx].node_id + "...");
     std::string tx_id;
     {
         std::string raw;
@@ -789,16 +907,20 @@ void CliSession::DoAttackSimulation() {
         }
     }
 
-    // Step 6: 提交相同交易到诚实节点
-    DbgPrint("Step 4 - 提交相同交易到诚实节点...");
+    // Step 7: 提交相同交易到诚实节点
+    DbgPrint("Step 6 - 提交相同交易到诚实节点...");
     for (size_t i = 0; i < nodes_.size(); ++i) {
         if (static_cast<int>(i) == bad_idx) continue;
         std::string raw;
         HttpPost(i, "/api/transactions/transfer", tx_body.dump(), raw);
     }
 
-    // Step 7: 对比所有节点的区块
-    DbgPrint("Step 5 - 对比所有节点区块...");
+    // 等待共识
+    std::cout << "\n  等待共识完成 (6s)...\n";
+    std::this_thread::sleep_for(std::chrono::seconds(6));
+
+    // Step 8: 对比所有节点的区块
+    DbgPrint("Step 7 - 对比所有节点区块...");
     std::cout << "\n  ── 拜占庭容错验证 ──\n";
     std::cout << "  节点   │ 角色     │ 高度 │ 区块哈希         │ Merkle根         │ state_root\n";
     std::cout << "  ───────┼──────────┼──────┼──────────────────┼──────────────────┼──────────────────\n";
@@ -829,28 +951,77 @@ void CliSession::DoAttackSimulation() {
                   << state.substr(0, 16) << "..\n";
     }
 
-    // Step 8: 验证结论
-    std::cout << "\n  ── 验证结论 ──\n";
+    // Step 9: 查询转账后各方余额
+    std::cout << "\n  ── 余额变化 ──\n";
+    std::cout << "  节点   │ " << std::setw(12) << sender.username << "余额 │ "
+              << std::setw(12) << receiver_name << "余额 │ Nonce\n";
+    std::cout << "  ───────┼──────────────┼──────────────┼──────\n";
 
-    // 对比恶意节点和诚实节点的 Merkle 根
+    auto sender_states = BroadcastGet("/api/state/" + sender.address);
+    auto victim_states = BroadcastGet("/api/state/" + receiver_addr);
+    bool balance_diverged = false;
+    uint64_t honest_sender_bal = 0, honest_victim_bal = 0;
+
+    for (size_t i = 0; i < nodes_.size(); ++i) {
+        uint64_t sbal = 0, vbal = 0, sn = 0;
+        if (i < sender_states.size() && sender_states[i].ok) {
+            auto sd = json::parse(sender_states[i].data);
+            sbal = sd.value("balance", 0ULL);
+            sn = sd.value("nonce", 0ULL);
+        }
+        if (i < victim_states.size() && victim_states[i].ok) {
+            auto vd = json::parse(victim_states[i].data);
+            vbal = vd.value("balance", 0ULL);
+        }
+        if (static_cast<int>(i) != bad_idx) {
+            if (honest_sender_bal == 0) { honest_sender_bal = sbal; honest_victim_bal = vbal; }
+            else if (sbal != honest_sender_bal || vbal != honest_victim_bal) balance_diverged = true;
+        }
+        std::cout << "  " << std::setw(6) << nodes_[i].node_id << " │ "
+                  << std::setw(12) << sbal << " │ "
+                  << std::setw(12) << vbal << " │ "
+                  << sn << "\n";
+    }
+
+    if (balance_diverged) {
+        std::cout << "  \033[31m⚠ 余额不一致! 恶意节点状态与诚实节点不同。\033[0m\n";
+    }
+
+    // Step 10: Merkle 证明对比
+    std::cout << "\n  ── Merkle 证明对比 ──\n";
     auto merkle_results = BroadcastGet("/api/proofs/tx/" + tx_id);
     std::string bad_merkle, honest_merkle;
     for (const auto& r : merkle_results) {
-        if (!r.ok) continue;
+        if (!r.ok) {
+            std::cout << "  " << nodes_[r.node_idx].node_id << ": \033[31m" << r.error << "\033[0m\n";
+            continue;
+        }
         auto d = json::parse(r.data);
         std::string root = d.value("root", "");
         if (static_cast<int>(r.node_idx) == bad_idx) bad_merkle = root;
-        else honest_merkle = root;
+        else if (honest_merkle.empty()) honest_merkle = root;
+        std::cout << "  " << nodes_[r.node_idx].node_id << ": root=" << root.substr(0, 40) << "...\n";
     }
 
+    // Step 11: 验证结论
+    std::cout << "\n  ── 验证结论 ──\n";
     if (!bad_merkle.empty() && !honest_merkle.empty() && bad_merkle != honest_merkle) {
         tampered = true;
-        std::cout << "  恶意节点 Merkle 根: " << bad_merkle.substr(0, 24) << "...\n";
-        std::cout << "  诚实节点 Merkle 根: " << honest_merkle.substr(0, 24) << "...\n";
-        std::cout << "  \033[31m✗ 数据不一致! 恶意节点篡改了区块数据。\033[0m\n";
-        std::cout << "  RBFT 共识: 诚实节点拒绝与恶意节点达成一致, 系统继续正常运行。\n";
+        std::cout << "  \033[31m✗ 拜占庭攻击生效!\033[0m 恶意节点数据被篡改。\n";
+        std::cout << "  恶意节点 Merkle 根: " << bad_merkle.substr(0, 40) << "...\n";
+        std::cout << "  诚实节点 Merkle 根: " << honest_merkle.substr(0, 40) << "...\n";
+        std::cout << "  \033[32mRBFT 容错: 诚实多数派(" << (nodes_.size() - 1) << "/" << nodes_.size()
+                  << ")维持正确链，恶意节点被隔离。\033[0m\n";
+    } else if (!bad_merkle.empty() && bad_merkle == honest_merkle) {
+        std::cout << "  \033[33m~ 攻击未生效。\033[0m\n";
+        if (bad_idx != primary_idx) {
+            std::cout << "  原因: 恶意节点不是主节点，未参与区块打包。\n";
+            std::cout << "  建议: 下次选择主节点(" << nodes_[primary_idx].node_id << ")作为攻击目标。\n";
+        } else {
+            std::cout << "  原因: 共识机制成功阻止了篡改，或攻击在传播前被修复。\n";
+        }
     } else {
-        std::cout << "  \033[32m✓ 所有节点数据一致 (攻击未生效或已被隔离)。\033[0m\n";
+        std::cout << "  \033[33m? 无法判定 (可能交易尚未打包或证明不可用)\033[0m\n";
     }
 
     // 查询共识状态
@@ -861,17 +1032,30 @@ void CliSession::DoAttackSimulation() {
         auto d = json::parse(r.data);
         std::string attack = d.value("attack_mode", "normal");
         int evidence = d.value("evidence_count", 0);
+        auto quarantined = d.value("quarantined_nodes", json::array());
         std::cout << "  " << nodes_[r.node_idx].node_id << ": attack_mode=" << attack
-                  << " evidence=" << evidence << "\n";
+                  << " evidence=" << evidence;
+        if (!quarantined.empty()) {
+            std::cout << " quarantined=[";
+            for (size_t qi = 0; qi < quarantined.size(); ++qi) {
+                if (qi > 0) std::cout << ",";
+                std::cout << quarantined[qi].get<std::string>();
+            }
+            std::cout << "]";
+        }
+        std::cout << "\n";
     }
 
     // 记录交易
     if (!tx_id.empty()) {
-        recent_txs_.push_back({tx_id, "TRANSFER", user.address, user.address, 1, tampered ? "REJECTED" : "COMMITTED"});
+        std::string status = tampered ? "REJECTED" : "COMMITTED";
+        recent_txs_.push_back({tx_id, "TRANSFER", sender.address, receiver_addr, transfer_amount, status});
         tx_order_.push_back(tx_id);
     }
 
-    Dbg("攻击模拟完成: tampered=" + std::string(tampered ? "true" : "false"));
+    Dbg("攻击模拟完成: sender=" + sender.username + " receiver=" + receiver_name
+        + " amount=" + std::to_string(transfer_amount) + " mode=" + mode_name
+        + " tampered=" + std::string(tampered ? "true" : "false"));
     Pause();
 }
 

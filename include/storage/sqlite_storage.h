@@ -1,6 +1,7 @@
 #pragma once
 
 #include "block/block.h"
+#include "common/types.h"
 #include "user/account_state.h"
 
 #include <optional>
@@ -32,6 +33,22 @@ public:
     std::optional<Block> GetLatestBlock() const;
     void PutMetadata(const std::string& key, const std::string& value);
     std::string GetMetadata(const std::string& key, const std::string& fallback = "") const;
+
+    // SMT 持久化
+    void PutSMTLeaf(const Hash& key, const Hash& value_hash, const std::vector<unsigned char>& value);
+    std::vector<std::tuple<Hash, Hash, std::vector<unsigned char>>> GetAllSMTLeaves() const;
+    void ClearSMTLeaves();
+    void PutStateRoot(uint64_t height, const std::string& state_root);
+    std::string GetStateRoot(uint64_t height) const;
+
+    // 链重组支持
+    void ClearChainData();
+
+    // 用户同步（链重组时用）
+    struct UserSyncData { std::string username; std::string password_hash; std::string address; std::string public_key; std::string private_key_encrypted; int64_t created_at; };
+    std::vector<UserSyncData> GetAllUsers() const;
+    void PutUser(const std::string& username, const std::string& password_hash, const std::string& address, const std::string& public_key, const std::string& private_key_encrypted, int64_t created_at);
+
     sqlite3* Raw() const { return db_; }
 
 private:

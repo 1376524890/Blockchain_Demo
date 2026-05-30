@@ -190,4 +190,18 @@ Hash SparseMerkleTree::DefaultHash(size_t depth) const {
     return default_hashes_[std::min(depth, static_cast<size_t>(256))];
 }
 
+std::vector<SparseMerkleTree::LeafData> SparseMerkleTree::GetAllLeaves() const {
+    std::vector<LeafData> result;
+    result.reserve(leaves_.size());
+    for (const auto& leaf : leaves_) {
+        result.push_back({leaf.key, leaf.value_hash, leaf.value});
+    }
+    return result;
+}
+
+void SparseMerkleTree::LoadLeaf(const Hash& key, const Hash& value_hash, const std::vector<unsigned char>& value) {
+    // 批量加载专用：直接追加，调用方保证无重复 key。
+    leaves_.push_back(Leaf{key, value_hash, value});
+}
+
 } // namespace rbft
