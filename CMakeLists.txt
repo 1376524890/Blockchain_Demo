@@ -26,6 +26,7 @@ FetchContent_MakeAvailable(json httplib googletest)
 file(GLOB_RECURSE RBFT_SOURCES CONFIGURE_DEPENDS src/*.cpp)
 list(FILTER RBFT_SOURCES EXCLUDE REGEX ".*/main\\.cpp$")
 list(FILTER RBFT_SOURCES EXCLUDE REGEX ".*/cli/.*\\.cpp$")
+list(FILTER RBFT_SOURCES EXCLUDE REGEX ".*/demo_.*\\.cpp$")
 
 add_library(rbft_core ${RBFT_SOURCES})
 target_include_directories(rbft_core PUBLIC include ${SODIUM_INCLUDE_DIRS} ${SQLITE3_INCLUDE_DIRS})
@@ -41,6 +42,13 @@ target_link_libraries(rbft_node PRIVATE rbft_core)
 add_executable(rbft_cli src/cli/main_cli.cpp src/cli/cli_session.cpp)
 target_include_directories(rbft_cli PRIVATE include)
 target_link_libraries(rbft_cli PRIVATE nlohmann_json::nlohmann_json httplib::httplib)
+
+# 调试演示用：哈希表数据结构 + 用户管理
+add_executable(rbft_demo_hash src/demo_hash_user.cpp)
+target_link_libraries(rbft_demo_hash PRIVATE rbft_core)
+
+add_executable(rbft_demo_merkle src/demo_merkle.cpp)
+target_link_libraries(rbft_demo_merkle PRIVATE rbft_core)
 
 enable_testing()
 file(GLOB UNIT_TESTS CONFIGURE_DEPENDS tests/unit/*.cpp)

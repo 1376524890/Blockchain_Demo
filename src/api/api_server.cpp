@@ -280,6 +280,7 @@ void ApiServer::RegisterRoutes(httplib::Server& server) {
             UserRecord u;
             // 如果客户端提供了 address/public_key/private_key，直接使用（多节点同步）
             if (j.contains("address") && j.contains("public_key") && j.contains("private_key")) {
+                // 进入核心注册逻辑
                 u = users_.RegisterWithKey(username, password,
                     j.at("address").get<std::string>(),
                     j.at("public_key").get<std::string>(),
@@ -297,7 +298,7 @@ void ApiServer::RegisterRoutes(httplib::Server& server) {
     server.Post("/api/users/login", [this](const httplib::Request& req, httplib::Response& res) {
         try {
             auto j = nlohmann::json::parse(req.body);
-            auto login = users_.Login(j.at("username").get<std::string>(), j.at("password").get<std::string>());
+    auto login = users_.Login(j.at("username").get<std::string>(), j.at("password").get<std::string>());
             ReplyJson(res, 200, Ok({{"token", login.token}, {"address", login.user.address},
                                    {"public_key", login.user.public_key_hex}, {"private_key", login.user.private_key_hex}}));
         } catch (const std::exception& e) {

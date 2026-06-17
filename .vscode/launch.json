@@ -1,0 +1,133 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "🔬 调试 rbft_node (CLI交互演示)",
+      "type": "cppdbg",
+      "request": "launch",
+      "program": "${workspaceFolder}/out/build/linux-debug/rbft_node",
+      "args": [
+        "--config",
+        "config/node1.json"
+      ],
+      "cwd": "${workspaceFolder}",
+      "stopAtEntry": false,
+      "environment": [],
+      "externalConsole": false,
+      "MIMode": "gdb",
+      "miDebuggerPath": "/usr/bin/gdb",
+      "setupCommands": [
+        {
+          "description": "Enable pretty-printing for STL containers",
+          "text": "-enable-pretty-printing",
+          "ignoreFailures": true
+        },
+        {
+          "description": "Unlimited print elements",
+          "text": "set print elements 0",
+          "ignoreFailures": true
+        },
+        {
+          "description": "Pretty print",
+          "text": "set print pretty on",
+          "ignoreFailures": true
+        },
+        {
+          "description": "Follow fork mode",
+          "text": "set follow-fork-mode child",
+          "ignoreFailures": true
+        }
+      ]
+    },
+    {
+      "name": "🎯 独立哈希表演示 (demo_hash_user)",
+      "type": "cppdbg",
+      "request": "launch",
+      "program": "${workspaceFolder}/out/build/linux-debug/rbft_demo_hash",
+      "args": [],
+      "cwd": "${workspaceFolder}",
+      "stopAtEntry": true,
+      "environment": [],
+      "externalConsole": false,
+      "MIMode": "gdb",
+      "miDebuggerPath": "/usr/bin/gdb",
+      "setupCommands": [
+        {
+          "description": "Enable pretty-printing",
+          "text": "-enable-pretty-printing",
+          "ignoreFailures": true
+        },
+        {
+          "description": "Unlimited print",
+          "text": "set print elements 0",
+          "ignoreFailures": true
+        },
+        {
+          "description": "Pretty print",
+          "text": "set print pretty on",
+          "ignoreFailures": true
+        }
+      ]
+    },
+    {
+      "name": "Merkle 树调试演示",
+      "type": "cppdbg",
+      "request": "launch",
+      "program": "${workspaceFolder}/out/build/linux-debug/rbft_demo_merkle",
+      "args": [],
+      "cwd": "${workspaceFolder}",
+      "stopAtEntry": true,
+      "environment": [],
+      "externalConsole": false,
+      "MIMode": "gdb",
+      "miDebuggerPath": "/usr/bin/gdb",
+      "setupCommands": [
+        {
+          "description": "Enable pretty-printing",
+          "text": "-enable-pretty-printing",
+          "ignoreFailures": true
+        },
+        {
+          "description": "Unlimited print",
+          "text": "set print elements 0",
+          "ignoreFailures": true
+        },
+        {
+          "description": "Pretty print",
+          "text": "set print pretty on",
+          "ignoreFailures": true
+        }
+      ]
+    },
+    {
+      "name": "🧪 调试单元测试",
+      "type": "cppdbg",
+      "request": "launch",
+      "program": "${workspaceFolder}/out/build/linux-debug/rbft_unit_tests",
+      "args": [],
+      "cwd": "${workspaceFolder}",
+      "stopAtEntry": false,
+      "environment": [],
+      "externalConsole": false,
+      "MIMode": "gdb",
+      "miDebuggerPath": "/usr/bin/gdb",
+      "setupCommands": [
+        {
+          "description": "Enable pretty-printing",
+          "text": "-enable-pretty-printing",
+          "ignoreFailures": true
+        },
+        {
+          "description": "Unlimited print",
+          "text": "set print elements 0",
+          "ignoreFailures": true
+        },
+        {
+          "description": "Pretty print",
+          "text": "set print pretty on",
+          "ignoreFailures": true
+        }
+      ]
+    }
+  ]
+}

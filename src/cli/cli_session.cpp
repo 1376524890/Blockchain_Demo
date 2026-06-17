@@ -260,7 +260,7 @@ void CliSession::ShowMenu() const {
         std::cout << "  当前用户: \033[33m" << users_[active_user_].username << "\033[0m  "
                   << "地址: " << users_[active_user_].address.substr(0, 12) << "...\n";
     }
-    std::cout << "\n请选择 [0-10]: ";
+    std::cout << "\n请选择 [0-12]: ";
 }
 
 void CliSession::Run() {

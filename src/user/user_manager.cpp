@@ -89,7 +89,9 @@ UserRecord UserManager::RegisterWithKey(const std::string& username, const std::
         sqlite3_finalize(stmt);
         storage_->PutAccount(AccountState{address, 1000, 0}, 0);
         storage_->Commit();
+        // 进入哈希表
         username_index_.Put(username, user_id);
+        // 进入哈希表
         address_index_.Put(address, user_id);
         return UserRecord{user_id, username, address, public_key_hex, private_key_hex};
     } catch (...) {

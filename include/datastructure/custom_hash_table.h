@@ -15,7 +15,7 @@ public:
         : buckets_(bucket_count == 0 ? 16 : bucket_count) {}
 
     void Put(const K& key, const V& value) {
-        // 手写链地址法哈希表：负载因子过高时扩容，避免桶内线性查找退化过快。
+        // 链地址法哈希表：负载因子过高时扩容，避免桶内线性查找退化过快。
         if (LoadFactor() > 0.75) {
             Rehash(buckets_.size() * 2);
         }
